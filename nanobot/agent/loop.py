@@ -80,13 +80,9 @@ def _decrypt_private_key(encrypted_b64: str) -> str:
     return aesgcm.decrypt(nonce, ct, None).decode("utf-8")
 
 
-# -- cost table for usage logging -------------------------------------------
+# -- hold-to-use threshold ---------------------------------------------------
 
-_ACTION_COSTS = {
-    "chat": 1,        # simple conversation
-    "tool_use": 2,    # used tools
-    "setup": 0,       # wallet setup is free
-}
+_MIN_FLAGENT_HOLD = 25_000  # Must hold 25k $FLAGENT for full access
 
 
 class AgentLoop:
@@ -409,33 +405,17 @@ class AgentLoop:
         return result[0] if result else new_user
 
     async def _check_balance(self, user: dict) -> bool:
-        """Return True if user has positive $FLAGENT balance."""
-        return (user.get("flagent_balance") or 0) > 0
+        """Return True if user holds >= 25,000 $FLAGENT."""
+        return (user.get("flagent_balance") or 0) >= _MIN_FLAGENT_HOLD
 
     async def _log_usage(
-        self, telegram_user_id: str, action_type: str, cost: int, detail: str = "",
+        self, telegram_user_id: str, action_type: str, detail: str = "",
     ) -> None:
-        """Deduct cost and log to bot_usage_log."""
-        if cost <= 0:
-            return
+        """Log action to bot_usage_log for analytics (no balance deduction)."""
         try:
-            # Deduct balance
-            rows = await db.select(
-                "bot_users",
-                {"telegram_user_id": f"eq.{telegram_user_id}", "select": "flagent_balance"},
-            )
-            if rows:
-                new_balance = max(0, (rows[0].get("flagent_balance") or 0) - cost)
-                await db.update(
-                    "bot_users",
-                    {"flagent_balance": new_balance},
-                    {"telegram_user_id": telegram_user_id},
-                )
-            # Log
             await db.insert("bot_usage_log", {
                 "telegram_user_id": telegram_user_id,
                 "action_type": action_type,
-                "cost": cost,
                 "detail": detail[:500] if detail else "",
             })
         except Exception:
@@ -464,10 +444,11 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id,
                 content=(
                     f"Your wallet: `{addr}`\n\n"
-                    f"Send $FLAGENT to this address to activate me.\n"
-                    f"After sending, tap /deposit to refresh your balance.\n\n"
-                    f"$FLAGENT CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
-                    f"Buy on PancakeSwap, then send to your wallet above."
+                    f"To start, send two things to this address:\n"
+                    f"1. $FLAGENT — hold at least 25,000 to unlock the bot\n"
+                    f"   CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
+                    f"2. BNB — for gas when trading (0.005 BNB is enough to start)\n\n"
+                    f"After sending $FLAGENT, tap /deposit to refresh your balance."
                 ),
             )
 
@@ -495,10 +476,11 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
             content=(
                 f"Your wallet: `{wallet_address}`\n\n"
-                f"Send $FLAGENT to this address to activate me.\n"
-                f"After sending, tap /deposit to refresh your balance.\n\n"
-                f"$FLAGENT CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
-                f"Buy on PancakeSwap, then send to your wallet above."
+                f"To start, send two things to this address:\n"
+                f"1. $FLAGENT — hold at least 25,000 to unlock the bot\n"
+                f"   CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
+                f"2. BNB — for gas when trading (0.005 BNB is enough to start)\n\n"
+                f"After sending $FLAGENT, tap /deposit to refresh your balance."
             ),
         )
 
@@ -572,9 +554,17 @@ class AgentLoop:
                 {"telegram_user_id": telegram_user_id},
             )
 
+            if balance >= _MIN_FLAGENT_HOLD:
+                deposit_msg = f"Balance: {balance:,.2f} $FLAGENT — Full access unlocked."
+            elif balance > 0:
+                needed = _MIN_FLAGENT_HOLD - balance
+                deposit_msg = f"Balance: {balance:,.2f} $FLAGENT — You need at least 25,000 to activate. Send {needed:,.0f} more."
+            else:
+                deposit_msg = f"Balance: 0 $FLAGENT — Send $FLAGENT to `{wallet}` to activate."
+
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
-                content=f"Balance updated: {balance:,.2f} $FLAGENT",
+                content=deposit_msg,
             )
         except Exception as e:
             logger.exception("Failed to check $FLAGENT balance for {}", telegram_user_id)
@@ -961,16 +951,19 @@ class AgentLoop:
             wallet_addr = user.get("wallet_address", "")
             if wallet_addr:
                 gate_msg = (
-                    "You need $FLAGENT to use me.\n"
-                    "1. Buy $FLAGENT on PancakeSwap (CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`)\n"
-                    f"2. Send $FLAGENT to your wallet: `{wallet_addr}`\n"
-                    "3. Tap /deposit to refresh your balance"
+                    "You need to hold at least 25,000 $FLAGENT to use me.\n\n"
+                    "1. Buy $FLAGENT on PancakeSwap\n"
+                    "   CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
+                    f"2. Send to your wallet: `{wallet_addr}`\n"
+                    "3. Tap /deposit to refresh your balance\n\n"
+                    "Your tokens stay in your wallet. You're holding, not spending."
                 )
             else:
                 gate_msg = (
-                    "You need $FLAGENT to use me.\n"
-                    "1. Buy $FLAGENT on PancakeSwap (CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`)\n"
-                    "2. Send $FLAGENT to your wallet\n"
+                    "You need to hold at least 25,000 $FLAGENT to use me.\n\n"
+                    "1. Buy $FLAGENT on PancakeSwap\n"
+                    "   CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
+                    "2. Send to your wallet\n"
                     "3. Tap /deposit to refresh your balance\n\n"
                     "No wallet yet? Run /setup first."
                 )
@@ -1040,11 +1033,10 @@ class AgentLoop:
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
 
-        # ---- Usage logging and balance deduction ----------------------------
+        # ---- Usage logging (analytics only, no deduction) --------------------
         action_type = "tool_use" if tools_used else "chat"
-        cost = _ACTION_COSTS.get(action_type, 1)
         await self._log_usage(
-            telegram_user_id, action_type, cost,
+            telegram_user_id, action_type,
             detail=f"tools={','.join(tools_used[:5])}" if tools_used else "",
         )
 
