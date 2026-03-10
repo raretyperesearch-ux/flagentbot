@@ -537,7 +537,7 @@ class AgentLoop:
         if not wallet:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
-                content="No wallet set up yet. Run /setup first.",
+                content="Run /setup first to create your wallet.",
             )
 
         try:
@@ -594,7 +594,7 @@ class AgentLoop:
         if not wallet:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
-                content="No wallet set up yet. Run /setup first.",
+                content="Run /setup first to create your wallet.",
             )
 
         # Fetch BNB balance from BSCScan
@@ -625,6 +625,13 @@ class AgentLoop:
 
     async def _handle_positions(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
         """Show open positions from bot_positions."""
+        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
+        if not user.get("wallet_address"):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Run /setup first to create your wallet.",
+            )
+
         rows = await db.select("bot_positions", {
             "telegram_user_id": f"eq.{telegram_user_id}",
             "order": "created_at.desc",
@@ -657,6 +664,13 @@ class AgentLoop:
 
     async def _handle_withdraw(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
         """Send BNB from user's wallet to a target address."""
+        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
+        if not user.get("wallet_address"):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Run /setup first to create your wallet.",
+            )
+
         parts = msg.content.strip().split()
         if len(parts) != 3:
             return OutboundMessage(
@@ -686,13 +700,11 @@ class AgentLoop:
                 content="Invalid BSC address format.",
             )
 
-        # Get user wallet
-        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
         encrypted_key = user.get("encrypted_private_key")
         if not encrypted_key:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
-                content="No wallet found. Run /setup first.",
+                content="Run /setup first to create your wallet.",
             )
 
         try:
@@ -738,7 +750,7 @@ class AgentLoop:
         if not encrypted_key:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
-                content="No wallet found. Run /setup first.",
+                content="Run /setup first to create your wallet.",
             )
 
         # Rate limit: once per 24 hours
