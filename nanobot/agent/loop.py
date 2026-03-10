@@ -9,7 +9,7 @@ import os
 import re
 import weakref
 from contextlib import AsyncExitStack
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -61,6 +61,23 @@ def _encrypt_private_key(private_key_hex: str) -> str:
     nonce = os.urandom(12)
     ct = aesgcm.encrypt(nonce, private_key_hex.encode("utf-8"), None)
     return base64.b64encode(nonce + ct).decode("ascii")
+
+
+def _decrypt_private_key(encrypted_b64: str) -> str:
+    """Decrypt a private key previously encrypted with _encrypt_private_key."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    enc_key = os.environ.get("ENCRYPTION_KEY", "")
+    if not enc_key:
+        raise RuntimeError("ENCRYPTION_KEY env var not set")
+    if len(enc_key) == 64:
+        key_bytes = bytes.fromhex(enc_key)
+    else:
+        key_bytes = enc_key.encode("utf-8")[:32].ljust(32, b"\0")
+    data = base64.b64decode(encrypted_b64)
+    nonce, ct = data[:12], data[12:]
+    aesgcm = AESGCM(key_bytes)
+    return aesgcm.decrypt(nonce, ct, None).decode("utf-8")
 
 
 # -- cost table for usage logging -------------------------------------------
@@ -478,6 +495,291 @@ class AgentLoop:
             ),
         )
 
+    # ---- /start command ----------------------------------------------------
+
+    async def _handle_start(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
+        """Send the welcome message."""
+        await self._ensure_user(telegram_user_id, msg.metadata or {})
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=(
+                "Welcome to FlagentBot\n\n"
+                "Your personal BSC assistant. Powered by Flagent's on-chain infrastructure.\n\n"
+                "I can:\n"
+                "- Analyze any token — drop a contract address\n"
+                "- Deep dive any wallet — drop a wallet address\n"
+                "- Trade on Four.Meme, Flap.sh, and PancakeSwap\n"
+                "- Track your portfolio and set alerts\n\n"
+                "Get started:\n"
+                "1. Run /setup to create your trading wallet\n"
+                "2. Deposit $FLAGENT to activate me\n"
+                "3. Start asking me anything about BSC\n\n"
+                "$FLAGENT: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
+                "Buy on PancakeSwap → deposit to your bot → start trading.\n\n"
+                "/help for all commands"
+            ),
+        )
+
+    # ---- /balance command --------------------------------------------------
+
+    async def _handle_balance(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
+        """Show BNB balance (from BSCScan) and $FLAGENT balance (from bot_users)."""
+        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
+        wallet = user.get("wallet_address")
+        flagent_balance = user.get("flagent_balance", 0) or 0
+
+        if not wallet:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="No wallet set up yet. Run /setup first.",
+            )
+
+        # Fetch BNB balance from BSCScan
+        bnb_balance = 0.0
+        try:
+            import httpx
+            bscscan_key = os.environ.get("BSCSCAN_API_KEY", "")
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get("https://api.bscscan.com/api", params={
+                    "module": "account", "action": "balance",
+                    "address": wallet, "tag": "latest", "apikey": bscscan_key,
+                })
+                data = resp.json()
+                bnb_balance = int(data.get("result", "0")) / 1e18
+        except Exception:
+            logger.exception("Failed to fetch BNB balance for {}", wallet)
+
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=(
+                f"Wallet: `{wallet}`\n\n"
+                f"BNB Balance: {bnb_balance:.4f} BNB\n"
+                f"$FLAGENT Balance: {flagent_balance}"
+            ),
+        )
+
+    # ---- /positions command ------------------------------------------------
+
+    async def _handle_positions(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
+        """Show open positions from bot_positions."""
+        rows = await db.select("bot_positions", {
+            "telegram_user_id": f"eq.{telegram_user_id}",
+            "order": "created_at.desc",
+            "limit": "20",
+        })
+
+        if not rows:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="No positions found. Start trading to see your portfolio here.",
+            )
+
+        lines = ["Your Positions:\n"]
+        for i, p in enumerate(rows, 1):
+            side = (p.get("side") or "?").upper()
+            token = p.get("token_address", "?")
+            short_token = token[:6] + "..." + token[-4:] if len(token) > 12 else token
+            bnb = float(p.get("bnb_amount") or 0)
+            platform = p.get("platform", "?")
+            tx = (p.get("tx_hash") or "?")[:16]
+            created = p.get("created_at", "")
+            lines.append(f"{i}. {side} `{short_token}` | {bnb:.4f} BNB | {platform} | {tx}...")
+
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="\n".join(lines),
+        )
+
+    # ---- /withdraw command -------------------------------------------------
+
+    async def _handle_withdraw(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
+        """Send BNB from user's wallet to a target address."""
+        parts = msg.content.strip().split()
+        if len(parts) != 3:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Usage: /withdraw <address> <amount>\nExample: `/withdraw 0x1234...abcd 0.1`",
+            )
+
+        target_address = parts[1]
+        try:
+            amount = float(parts[2])
+        except ValueError:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Invalid amount. Use a number like 0.1",
+            )
+
+        if amount <= 0:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Amount must be greater than 0.",
+            )
+
+        # Validate address format
+        if not re.match(r'^0x[0-9a-fA-F]{40}$', target_address):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Invalid BSC address format.",
+            )
+
+        # Get user wallet
+        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
+        encrypted_key = user.get("encrypted_private_key")
+        if not encrypted_key:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="No wallet found. Run /setup first.",
+            )
+
+        try:
+            from web3 import Web3
+            pk = _decrypt_private_key(encrypted_key)
+            w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org"))
+            account = w3.eth.account.from_key(pk)
+            value_wei = w3.to_wei(amount, "ether")
+
+            tx = {
+                "to": Web3.to_checksum_address(target_address),
+                "value": value_wei,
+                "gas": 21_000,
+                "gasPrice": w3.eth.gas_price,
+                "nonce": w3.eth.get_transaction_count(account.address),
+                "chainId": 56,
+            }
+            signed = account.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=(
+                    f"Withdrawal sent!\n\n"
+                    f"To: `{target_address}`\n"
+                    f"Amount: {amount} BNB\n"
+                    f"Tx: `{tx_hash}`"
+                ),
+            )
+        except Exception as e:
+            logger.exception("Withdraw failed for user {}", telegram_user_id)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Withdrawal failed: {e}",
+            )
+
+    # ---- /export_key command -----------------------------------------------
+
+    async def _handle_export_key(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
+        """Decrypt and send the user's private key. Rate limited to once per 24h."""
+        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
+        encrypted_key = user.get("encrypted_private_key")
+        if not encrypted_key:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="No wallet found. Run /setup first.",
+            )
+
+        # Rate limit: once per 24 hours
+        last_export = user.get("last_key_export")
+        if last_export:
+            try:
+                last_dt = datetime.fromisoformat(last_export.replace("Z", "+00:00"))
+                elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+                if elapsed < 86400:
+                    hours_left = int((86400 - elapsed) / 3600)
+                    return OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content=f"Key export is rate limited to once per 24 hours. Try again in ~{hours_left}h.",
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        try:
+            pk = _decrypt_private_key(encrypted_key)
+        except Exception:
+            logger.exception("Failed to decrypt key for user {}", telegram_user_id)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Failed to decrypt your key. Contact support.",
+            )
+
+        # Update last_key_export timestamp
+        await db.update(
+            "bot_users",
+            {"last_key_export": datetime.now(timezone.utc).isoformat()},
+            {"telegram_user_id": telegram_user_id},
+        )
+
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=(
+                f"⚠️ This is your private key. Anyone with this can access your funds. "
+                f"Import it into MetaMask or any BSC wallet. Never share it.\n\n"
+                f"`{pk}`"
+            ),
+        )
+
+    # ---- /usage command ----------------------------------------------------
+
+    async def _handle_usage(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
+        """Show $FLAGENT spending history from bot_usage_log."""
+        rows = await db.select("bot_usage_log", {
+            "telegram_user_id": f"eq.{telegram_user_id}",
+            "order": "created_at.desc",
+            "limit": "100",
+        })
+
+        if not rows:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="No usage history yet.",
+            )
+
+        # Aggregate by action type
+        totals: dict[str, int] = {}
+        for r in rows:
+            action = r.get("action_type", "unknown")
+            cost = int(r.get("cost") or 0)
+            totals[action] = totals.get(action, 0) + cost
+
+        grand_total = sum(totals.values())
+
+        lines = ["$FLAGENT Usage:\n"]
+        for action, total in sorted(totals.items(), key=lambda x: -x[1]):
+            lines.append(f"  {action}: {total} $FLAGENT")
+        lines.append(f"\nTotal consumed: {grand_total} $FLAGENT")
+        lines.append(f"Transactions: {len(rows)}")
+
+        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
+        balance = user.get("flagent_balance", 0) or 0
+        lines.append(f"Current balance: {balance} $FLAGENT")
+
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content="\n".join(lines),
+        )
+
+    # ---- /help command -----------------------------------------------------
+
+    async def _handle_help(self, msg: InboundMessage) -> OutboundMessage:
+        """Show all commands."""
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=(
+                "FlagentBot Commands:\n\n"
+                "/start — Meet your BSC assistant\n"
+                "/setup — Create your trading wallet\n"
+                "/balance — Check your BNB + $FLAGENT balance\n"
+                "/positions — View your open trades\n"
+                "/withdraw — Withdraw BNB (usage: /withdraw 0xAddress 0.1)\n"
+                "/export_key — Export your wallet private key\n"
+                "/usage — See your $FLAGENT spending history\n"
+                "/help — Show this message\n"
+                "/new — Start a fresh conversation\n\n"
+                "Or just talk to me — drop a contract address to analyze a token, "
+                "drop a wallet to analyze a trader, or tell me to buy/sell."
+            ),
+        )
+
     # ---- Main message processing -------------------------------------------
 
     async def _process_message(
@@ -520,9 +822,28 @@ class AgentLoop:
 
         # Slash commands
         cmd = msg.content.strip().lower()
+        cmd_word = cmd.split()[0] if cmd else ""
+
+        if cmd == "/start":
+            return await self._handle_start(msg, telegram_user_id)
 
         if cmd == "/setup":
             return await self._handle_setup(msg, telegram_user_id)
+
+        if cmd == "/balance":
+            return await self._handle_balance(msg, telegram_user_id)
+
+        if cmd == "/positions":
+            return await self._handle_positions(msg, telegram_user_id)
+
+        if cmd_word == "/withdraw":
+            return await self._handle_withdraw(msg, telegram_user_id)
+
+        if cmd == "/export_key":
+            return await self._handle_export_key(msg, telegram_user_id)
+
+        if cmd == "/usage":
+            return await self._handle_usage(msg, telegram_user_id)
 
         if cmd == "/new":
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
@@ -554,14 +875,7 @@ class AgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content=(
-                                      "FlagentBot commands:\n"
-                                      "/setup — Create your BSC wallet\n"
-                                      "/new — Start a new conversation\n"
-                                      "/stop — Stop the current task\n"
-                                      "/help — Show available commands"
-                                  ))
+            return await self._handle_help(msg)
 
         # ---- Balance check --------------------------------------------------
         if not await self._check_balance(user):

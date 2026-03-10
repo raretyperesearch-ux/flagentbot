@@ -158,11 +158,16 @@ class TelegramChannel(BaseChannel):
 
     # Commands registered with Telegram's command menu
     BOT_COMMANDS = [
-        BotCommand("start", "Start FlagentBot"),
-        BotCommand("setup", "Create your BSC wallet"),
-        BotCommand("new", "Start a new conversation"),
+        BotCommand("start", "Meet your BSC assistant"),
+        BotCommand("setup", "Create your trading wallet"),
+        BotCommand("balance", "Check your BNB + $FLAGENT balance"),
+        BotCommand("positions", "View your open trades"),
+        BotCommand("withdraw", "Withdraw BNB to another wallet"),
+        BotCommand("export_key", "Export your wallet private key"),
+        BotCommand("usage", "See your $FLAGENT spending history"),
+        BotCommand("help", "Show all commands"),
+        BotCommand("new", "Start a fresh conversation"),
         BotCommand("stop", "Stop the current task"),
-        BotCommand("help", "Show available commands"),
     ]
 
     def __init__(
@@ -222,12 +227,10 @@ class TelegramChannel(BaseChannel):
         self._app = builder.build()
         self._app.add_error_handler(self._on_error)
 
-        # Add command handlers
-        self._app.add_handler(CommandHandler("start", self._on_start))
-        self._app.add_handler(CommandHandler("setup", self._forward_command))
-        self._app.add_handler(CommandHandler("new", self._forward_command))
-        self._app.add_handler(CommandHandler("stop", self._forward_command))
-        self._app.add_handler(CommandHandler("help", self._on_help))
+        # Add command handlers — all forwarded to AgentLoop via bus
+        for cmd_name in ("start", "setup", "balance", "positions", "withdraw",
+                         "export_key", "usage", "help", "new", "stop"):
+            self._app.add_handler(CommandHandler(cmd_name, self._forward_command))
 
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -417,30 +420,6 @@ class TelegramChannel(BaseChannel):
         except Exception:
             pass
         await self._send_text(chat_id, text, reply_params, thread_kwargs)
-
-    async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /start command."""
-        if not update.message or not update.effective_user:
-            return
-
-        user = update.effective_user
-        await update.message.reply_text(
-            f"Hi {user.first_name}! I'm FlagentBot — your personal BSC assistant.\n\n"
-            "Use /setup to create your BSC wallet, then send me a message!\n"
-            "Type /help to see available commands."
-        )
-
-    async def _on_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /help command, bypassing ACL so all users can access it."""
-        if not update.message:
-            return
-        await update.message.reply_text(
-            "FlagentBot commands:\n"
-            "/setup — Create your BSC wallet\n"
-            "/new — Start a new conversation\n"
-            "/stop — Stop the current task\n"
-            "/help — Show available commands"
-        )
 
     @staticmethod
     def _sender_id(user) -> str:
