@@ -44,6 +44,8 @@ dependencies = [
     "json-repair>=0.57.0,<1.0.0",
     "chardet>=3.0.2,<6.0.0",
     "openai>=2.8.0",
+    "eth-account>=0.13.0,<1.0.0",
+    "cryptography>=44.0.0,<45.0.0",
 ]
 
 [project.optional-dependencies]

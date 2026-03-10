@@ -1,12 +1,15 @@
-"""Agent loop: the core processing engine."""
+"""Agent loop: the core processing engine for FlagentBot."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import os
 import re
 import weakref
 from contextlib import AsyncExitStack
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -26,10 +29,47 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
+from nanobot import supabase_client as db
 
 if TYPE_CHECKING:
     from nanobot.config.schema import ChannelsConfig, ExecToolConfig
     from nanobot.cron.service import CronService
+
+
+# -- helpers for /setup wallet generation ------------------------------------
+
+def _parse_telegram_user_id(sender_id: str) -> str:
+    """Extract numeric Telegram user ID from sender_id (format: 'id|username' or just 'id')."""
+    return sender_id.split("|", 1)[0]
+
+
+def _encrypt_private_key(private_key_hex: str) -> str:
+    """Encrypt a private key with AES-256-GCM using ENCRYPTION_KEY env var.
+    Returns base64-encoded (nonce + ciphertext + tag).
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    enc_key = os.environ.get("ENCRYPTION_KEY", "")
+    if not enc_key:
+        raise RuntimeError("ENCRYPTION_KEY env var not set — cannot encrypt wallet key")
+    # Key should be 32 bytes; derive from hex or utf-8
+    if len(enc_key) == 64:
+        key_bytes = bytes.fromhex(enc_key)
+    else:
+        key_bytes = enc_key.encode("utf-8")[:32].ljust(32, b"\0")
+    aesgcm = AESGCM(key_bytes)
+    nonce = os.urandom(12)
+    ct = aesgcm.encrypt(nonce, private_key_hex.encode("utf-8"), None)
+    return base64.b64encode(nonce + ct).decode("ascii")
+
+
+# -- cost table for usage logging -------------------------------------------
+
+_ACTION_COSTS = {
+    "chat": 1,        # simple conversation
+    "tool_use": 2,    # used tools
+    "setup": 0,       # wallet setup is free
+}
 
 
 class AgentLoop:
@@ -38,10 +78,12 @@ class AgentLoop:
 
     It:
     1. Receives messages from the bus
-    2. Builds context with history, memory, skills
-    3. Calls the LLM
-    4. Executes tool calls
-    5. Sends responses back
+    2. Checks user balance ($FLAGENT)
+    3. Builds context with history, per-user memory, skills
+    4. Calls the LLM
+    5. Executes tool calls
+    6. Sends responses back
+    7. Deducts $FLAGENT and logs usage
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
@@ -260,7 +302,7 @@ class AgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
-        logger.info("Agent loop started")
+        logger.info("FlagentBot agent loop started")
 
         while self._running:
             try:
@@ -286,7 +328,7 @@ class AgentLoop:
                 pass
         sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
         total = cancelled + sub_cancelled
-        content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
+        content = f"Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
@@ -325,7 +367,118 @@ class AgentLoop:
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
-        logger.info("Agent loop stopping")
+        logger.info("FlagentBot agent loop stopping")
+
+    # ---- User middleware (Supabase) -----------------------------------------
+
+    async def _ensure_user(self, telegram_user_id: str, metadata: dict) -> dict:
+        """Look up or create user in bot_users. Returns user row."""
+        rows = await db.select(
+            "bot_users",
+            {"telegram_user_id": f"eq.{telegram_user_id}", "select": "*"},
+        )
+        if rows:
+            return rows[0]
+        # Create new user
+        username = metadata.get("username", "")
+        first_name = metadata.get("first_name", "")
+        new_user = {
+            "telegram_user_id": telegram_user_id,
+            "telegram_username": username or "",
+            "display_name": first_name or username or telegram_user_id,
+            "flagent_balance": 0,
+        }
+        result = await db.insert("bot_users", new_user)
+        return result[0] if result else new_user
+
+    async def _check_balance(self, user: dict) -> bool:
+        """Return True if user has positive $FLAGENT balance."""
+        return (user.get("flagent_balance") or 0) > 0
+
+    async def _log_usage(
+        self, telegram_user_id: str, action_type: str, cost: int, detail: str = "",
+    ) -> None:
+        """Deduct cost and log to bot_usage_log."""
+        if cost <= 0:
+            return
+        try:
+            # Deduct balance
+            rows = await db.select(
+                "bot_users",
+                {"telegram_user_id": f"eq.{telegram_user_id}", "select": "flagent_balance"},
+            )
+            if rows:
+                new_balance = max(0, (rows[0].get("flagent_balance") or 0) - cost)
+                await db.update(
+                    "bot_users",
+                    {"flagent_balance": new_balance},
+                    {"telegram_user_id": telegram_user_id},
+                )
+            # Log
+            await db.insert("bot_usage_log", {
+                "telegram_user_id": telegram_user_id,
+                "action_type": action_type,
+                "cost": cost,
+                "detail": detail[:500] if detail else "",
+            })
+        except Exception:
+            logger.exception("Failed to log usage for user {}", telegram_user_id)
+
+    # ---- /setup command ----------------------------------------------------
+
+    async def _handle_setup(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
+        """Generate a BSC wallet and store encrypted private key in bot_users."""
+        try:
+            from eth_account import Account
+        except ImportError:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Wallet generation unavailable (eth_account not installed).",
+            )
+
+        # Check if user already has a wallet
+        rows = await db.select(
+            "bot_users",
+            {"telegram_user_id": f"eq.{telegram_user_id}", "select": "wallet_address"},
+        )
+        if rows and rows[0].get("wallet_address"):
+            addr = rows[0]["wallet_address"]
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"You already have a wallet set up.\n\nAddress: `{addr}`",
+            )
+
+        # Generate new account
+        acct = Account.create()
+        wallet_address = acct.address
+        private_key_hex = acct.key.hex()
+
+        try:
+            encrypted_key = _encrypt_private_key(private_key_hex)
+        except RuntimeError as e:
+            logger.error("Wallet setup failed: {}", e)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Wallet setup failed — server configuration error.",
+            )
+
+        await db.update(
+            "bot_users",
+            {"wallet_address": wallet_address, "encrypted_private_key": encrypted_key},
+            {"telegram_user_id": telegram_user_id},
+        )
+
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=(
+                f"Your BSC wallet is ready!\n\n"
+                f"Address: `{wallet_address}`\n\n"
+                f"Send BNB to this address to start using DeFi features. "
+                f"Your private key is encrypted and stored securely."
+            ),
+        )
+
+    # ---- Main message processing -------------------------------------------
 
     async def _process_message(
         self,
@@ -343,7 +496,9 @@ class AgentLoop:
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
-            messages = self.context.build_messages(
+            # System messages don't have per-user memory context
+            self.context.set_memory(MemoryStore(None))
+            messages = await self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
@@ -356,11 +511,19 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
+        # ---- User middleware: extract ID, ensure user, check balance --------
+        telegram_user_id = _parse_telegram_user_id(msg.sender_id)
+        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
+
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
         # Slash commands
         cmd = msg.content.strip().lower()
+
+        if cmd == "/setup":
+            return await self._handle_setup(msg, telegram_user_id)
+
         if cmd == "/new":
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
             self._consolidating.add(session.key)
@@ -370,7 +533,8 @@ class AgentLoop:
                     if snapshot:
                         temp = Session(key=session.key)
                         temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True):
+                        memory = MemoryStore(telegram_user_id)
+                        if not await memory.consolidate(temp, self.provider, self.model, archive_all=True):
                             return OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
                                 content="Memory archival failed, session not cleared. Please try again.",
@@ -391,17 +555,37 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+                                  content=(
+                                      "FlagentBot commands:\n"
+                                      "/setup — Create your BSC wallet\n"
+                                      "/new — Start a new conversation\n"
+                                      "/stop — Stop the current task\n"
+                                      "/help — Show available commands"
+                                  ))
 
+        # ---- Balance check --------------------------------------------------
+        if not await self._check_balance(user):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Deposit $FLAGENT to activate me.",
+            )
+
+        # ---- Memory consolidation trigger -----------------------------------
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
             self._consolidating.add(session.key)
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
 
+            _user_id = telegram_user_id  # capture for closure
+
             async def _consolidate_and_unlock():
                 try:
                     async with lock:
-                        await self._consolidate_memory(session)
+                        memory = MemoryStore(_user_id)
+                        await memory.consolidate(
+                            session, self.provider, self.model,
+                            memory_window=self.memory_window,
+                        )
                 finally:
                     self._consolidating.discard(session.key)
                     _task = asyncio.current_task()
@@ -411,13 +595,18 @@ class AgentLoop:
             _task = asyncio.create_task(_consolidate_and_unlock())
             self._consolidation_tasks.add(_task)
 
+        # ---- Build context and run agent loop --------------------------------
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
+        # Set per-user memory for context building
+        user_memory = MemoryStore(telegram_user_id)
+        self.context.set_memory(user_memory)
+
         history = session.get_history(max_messages=self.memory_window)
-        initial_messages = self.context.build_messages(
+        initial_messages = await self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
@@ -432,7 +621,7 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, tools_used, all_msgs = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
         )
 
@@ -441,6 +630,14 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
+
+        # ---- Usage logging and balance deduction ----------------------------
+        action_type = "tool_use" if tools_used else "chat"
+        cost = _ACTION_COSTS.get(action_type, 1)
+        await self._log_usage(
+            telegram_user_id, action_type, cost,
+            detail=f"tools={','.join(tools_used[:5])}" if tools_used else "",
+        )
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -454,7 +651,6 @@ class AgentLoop:
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
-        from datetime import datetime
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
@@ -487,9 +683,10 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
-    async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
+    async def _consolidate_memory(self, session, telegram_user_id: str | None = None, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        return await MemoryStore(self.workspace).consolidate(
+        memory = MemoryStore(telegram_user_id)
+        return await memory.consolidate(
             session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
         )

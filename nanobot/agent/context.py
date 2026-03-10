@@ -21,10 +21,14 @@ class ContextBuilder:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
-        self.memory = MemoryStore(workspace)
+        self.memory: MemoryStore | None = None  # Set per-request via set_memory()
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def set_memory(self, memory: MemoryStore) -> None:
+        """Set the per-user memory store for the current request."""
+        self.memory = memory
+
+    async def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
@@ -32,7 +36,10 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
+        if self.memory:
+            memory = await self.memory.get_memory_context()
+        else:
+            memory = ""
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
@@ -72,27 +79,26 @@ Skills with available="false" need dependencies installed first - you can try in
 - Use file tools when they are simpler or more reliable than shell commands.
 """
 
-        return f"""# nanobot 🐈
+        return f"""# FlagentBot 🏴
 
-You are nanobot, a helpful AI assistant.
+You are FlagentBot, a personal BSC (BNB Smart Chain) assistant on Telegram.
+You help users manage their crypto wallets, track positions, set alerts, and interact with BSC DeFi protocols.
 
 ## Runtime
 {runtime}
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md (write important facts here)
-- History log: {workspace_path}/memory/HISTORY.md (grep-searchable). Each entry starts with [YYYY-MM-DD HH:MM].
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
 {platform_policy}
 
-## nanobot Guidelines
+## FlagentBot Guidelines
+- Each user has their own wallet, memory, and session. Never leak data between users.
 - State intent before tool calls, but NEVER predict or claim results before receiving them.
-- Before modifying a file, read it first. Do not assume files or directories exist.
-- After writing or editing a file, re-read it if accuracy matters.
 - If a tool call fails, analyze the error before retrying with a different approach.
 - Ask for clarification when the request is ambiguous.
+- Keep responses concise — users are on mobile Telegram.
 
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
 
@@ -118,7 +124,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         return "\n\n".join(parts) if parts else ""
 
-    def build_messages(
+    async def build_messages(
         self,
         history: list[dict[str, Any]],
         current_message: str,
@@ -139,7 +145,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             merged = [{"type": "text", "text": runtime_ctx}] + user_content
 
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {"role": "system", "content": await self.build_system_prompt(skill_names)},
             *history,
             {"role": "user", "content": merged},
         ]

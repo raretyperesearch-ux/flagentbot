@@ -158,7 +158,8 @@ class TelegramChannel(BaseChannel):
 
     # Commands registered with Telegram's command menu
     BOT_COMMANDS = [
-        BotCommand("start", "Start the bot"),
+        BotCommand("start", "Start FlagentBot"),
+        BotCommand("setup", "Create your BSC wallet"),
         BotCommand("new", "Start a new conversation"),
         BotCommand("stop", "Stop the current task"),
         BotCommand("help", "Show available commands"),
@@ -223,6 +224,7 @@ class TelegramChannel(BaseChannel):
 
         # Add command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
+        self._app.add_handler(CommandHandler("setup", self._forward_command))
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
@@ -423,8 +425,8 @@ class TelegramChannel(BaseChannel):
 
         user = update.effective_user
         await update.message.reply_text(
-            f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
-            "Send me a message and I'll respond!\n"
+            f"Hi {user.first_name}! I'm FlagentBot — your personal BSC assistant.\n\n"
+            "Use /setup to create your BSC wallet, then send me a message!\n"
             "Type /help to see available commands."
         )
 
@@ -433,7 +435,8 @@ class TelegramChannel(BaseChannel):
         if not update.message:
             return
         await update.message.reply_text(
-            "🐈 nanobot commands:\n"
+            "FlagentBot commands:\n"
+            "/setup — Create your BSC wallet\n"
             "/new — Start a new conversation\n"
             "/stop — Stop the current task\n"
             "/help — Show available commands"

@@ -28,7 +28,7 @@ class TelegramConfig(Base):
 
     enabled: bool = False
     token: str = ""  # Bot token from @BotFather
-    allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs or usernames
+    allow_from: list[str] = Field(default_factory=lambda: ["*"])  # Allowed user IDs or usernames
     proxy: str | None = (
         None  # HTTP/SOCKS5 proxy URL, e.g. "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080"
     )
@@ -222,11 +222,9 @@ class ChannelsConfig(Base):
 class AgentDefaults(Base):
     """Default agent configuration."""
 
-    workspace: str = "~/.nanobot/workspace"
-    model: str = "anthropic/claude-opus-4-5"
-    provider: str = (
-        "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
-    )
+    workspace: str = "~/.flagentbot/workspace"
+    model: str = "anthropic/claude-sonnet-4-20250514"
+    provider: str = "anthropic"
     max_tokens: int = 8192
     temperature: float = 0.1
     max_tool_iterations: int = 40

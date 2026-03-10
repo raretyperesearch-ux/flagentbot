@@ -1,14 +1,13 @@
-"""Memory system for persistent agent memory."""
+"""Per-user memory system backed by Supabase (bot_user_memory table)."""
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir
+from nanobot import supabase_client as db
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
@@ -43,28 +42,69 @@ _SAVE_MEMORY_TOOL = [
 
 
 class MemoryStore:
-    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
+    """Per-user two-layer memory backed by Supabase bot_user_memory table.
 
-    def __init__(self, workspace: Path):
-        self.memory_dir = ensure_dir(workspace / "memory")
-        self.memory_file = self.memory_dir / "MEMORY.md"
-        self.history_file = self.memory_dir / "HISTORY.md"
+    Each Telegram user gets their own memory_text (long-term facts) and
+    history_entries (timestamped log), keyed by telegram_user_id.
+    """
 
-    def read_long_term(self) -> str:
-        if self.memory_file.exists():
-            return self.memory_file.read_text(encoding="utf-8")
-        return ""
+    def __init__(self, telegram_user_id: str | None = None):
+        self.telegram_user_id = telegram_user_id
 
-    def write_long_term(self, content: str) -> None:
-        self.memory_file.write_text(content, encoding="utf-8")
+    # -- read / write helpers --------------------------------------------------
 
-    def append_history(self, entry: str) -> None:
-        with open(self.history_file, "a", encoding="utf-8") as f:
-            f.write(entry.rstrip() + "\n\n")
+    async def _get_row(self) -> dict | None:
+        """Fetch the memory row for the current user."""
+        if not self.telegram_user_id:
+            return None
+        rows = await db.select(
+            "bot_user_memory",
+            {"telegram_user_id": f"eq.{self.telegram_user_id}", "select": "*"},
+        )
+        return rows[0] if rows else None
 
-    def get_memory_context(self) -> str:
-        long_term = self.read_long_term()
+    async def _ensure_row(self) -> None:
+        """Create the memory row if it doesn't exist yet."""
+        if not self.telegram_user_id:
+            return
+        await db.upsert(
+            "bot_user_memory",
+            {"telegram_user_id": self.telegram_user_id, "memory_text": "", "history_entries": ""},
+            on_conflict="telegram_user_id",
+        )
+
+    async def read_long_term(self) -> str:
+        row = await self._get_row()
+        return (row or {}).get("memory_text", "") or ""
+
+    async def write_long_term(self, content: str) -> None:
+        if not self.telegram_user_id:
+            return
+        await self._ensure_row()
+        await db.update(
+            "bot_user_memory",
+            {"memory_text": content},
+            {"telegram_user_id": self.telegram_user_id},
+        )
+
+    async def append_history(self, entry: str) -> None:
+        if not self.telegram_user_id:
+            return
+        await self._ensure_row()
+        row = await self._get_row()
+        existing = (row or {}).get("history_entries", "") or ""
+        updated = existing + entry.rstrip() + "\n\n"
+        await db.update(
+            "bot_user_memory",
+            {"history_entries": updated},
+            {"telegram_user_id": self.telegram_user_id},
+        )
+
+    async def get_memory_context(self) -> str:
+        long_term = await self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
+
+    # -- LLM-driven consolidation ----------------------------------------------
 
     async def consolidate(
         self,
@@ -75,7 +115,7 @@ class MemoryStore:
         archive_all: bool = False,
         memory_window: int = 50,
     ) -> bool:
-        """Consolidate old messages into MEMORY.md + HISTORY.md via LLM tool call.
+        """Consolidate old messages into Supabase memory via LLM tool call.
 
         Returns True on success (including no-op), False on failure.
         """
@@ -101,7 +141,7 @@ class MemoryStore:
             tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
             lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
 
-        current_memory = self.read_long_term()
+        current_memory = await self.read_long_term()
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
 
 ## Current Long-term Memory
@@ -125,10 +165,8 @@ class MemoryStore:
                 return False
 
             args = response.tool_calls[0].arguments
-            # Some providers return arguments as a JSON string instead of dict
             if isinstance(args, str):
                 args = json.loads(args)
-            # Some providers return arguments as a list (handle edge case)
             if isinstance(args, list):
                 if args and isinstance(args[0], dict):
                     args = args[0]
@@ -142,12 +180,12 @@ class MemoryStore:
             if entry := args.get("history_entry"):
                 if not isinstance(entry, str):
                     entry = json.dumps(entry, ensure_ascii=False)
-                self.append_history(entry)
+                await self.append_history(entry)
             if update := args.get("memory_update"):
                 if not isinstance(update, str):
                     update = json.dumps(update, ensure_ascii=False)
                 if update != current_memory:
-                    self.write_long_term(update)
+                    await self.write_long_term(update)
 
             session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
             logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
