@@ -462,7 +462,13 @@ class AgentLoop:
             addr = rows[0]["wallet_address"]
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
-                content=f"You already have a wallet set up.\n\nAddress: `{addr}`",
+                content=(
+                    f"Your wallet: `{addr}`\n\n"
+                    f"Send $FLAGENT to this address to activate me.\n"
+                    f"After sending, tap /deposit to refresh your balance.\n\n"
+                    f"$FLAGENT CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
+                    f"Buy on PancakeSwap, then send to your wallet above."
+                ),
             )
 
         # Generate new account
@@ -488,10 +494,11 @@ class AgentLoop:
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
             content=(
-                f"Your BSC wallet is ready!\n\n"
-                f"Address: `{wallet_address}`\n\n"
-                f"Send BNB to this address to start using DeFi features. "
-                f"Your private key is encrypted and stored securely."
+                f"Your wallet: `{wallet_address}`\n\n"
+                f"Send $FLAGENT to this address to activate me.\n"
+                f"After sending, tap /deposit to refresh your balance.\n\n"
+                f"$FLAGENT CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
+                f"Buy on PancakeSwap, then send to your wallet above."
             ),
         )
 
@@ -512,13 +519,69 @@ class AgentLoop:
                 "- Track your portfolio and set alerts\n\n"
                 "Get started:\n"
                 "1. Run /setup to create your trading wallet\n"
-                "2. Deposit $FLAGENT to activate me\n"
-                "3. Start asking me anything about BSC\n\n"
-                "$FLAGENT: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
-                "Buy on PancakeSwap → deposit to your bot → start trading.\n\n"
+                "2. Buy $FLAGENT on PancakeSwap and send to your wallet\n"
+                "3. Tap /deposit to refresh your balance\n"
+                "4. Start asking me anything about BSC\n\n"
+                "$FLAGENT: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n\n"
                 "/help for all commands"
             ),
         )
+
+    # ---- /deposit command --------------------------------------------------
+
+    async def _handle_deposit(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
+        """Check on-chain $FLAGENT balance and update bot_users."""
+        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
+        wallet = user.get("wallet_address")
+
+        if not wallet:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="No wallet set up yet. Run /setup first.",
+            )
+
+        try:
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org"))
+            flagent_ca = Web3.to_checksum_address("0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF")
+            erc20_abi = [{
+                "name": "balanceOf",
+                "type": "function",
+                "stateMutability": "view",
+                "inputs": [{"name": "account", "type": "address"}],
+                "outputs": [{"name": "", "type": "uint256"}],
+            }, {
+                "name": "decimals",
+                "type": "function",
+                "stateMutability": "view",
+                "inputs": [],
+                "outputs": [{"name": "", "type": "uint8"}],
+            }]
+            contract = w3.eth.contract(address=flagent_ca, abi=erc20_abi)
+            raw_balance = contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
+            try:
+                decimals = contract.functions.decimals().call()
+            except Exception:
+                decimals = 18
+            balance = raw_balance / (10 ** decimals)
+
+            # Update bot_users with on-chain balance
+            await db.update(
+                "bot_users",
+                {"flagent_balance": balance},
+                {"telegram_user_id": telegram_user_id},
+            )
+
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Balance updated: {balance:,.2f} $FLAGENT",
+            )
+        except Exception as e:
+            logger.exception("Failed to check $FLAGENT balance for {}", telegram_user_id)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Failed to check balance: {e}",
+            )
 
     # ---- /balance command --------------------------------------------------
 
@@ -768,6 +831,7 @@ class AgentLoop:
                 "FlagentBot Commands:\n\n"
                 "/start — Meet your BSC assistant\n"
                 "/setup — Create your trading wallet\n"
+                "/deposit — Refresh your $FLAGENT balance\n"
                 "/balance — Check your BNB + $FLAGENT balance\n"
                 "/positions — View your open trades\n"
                 "/withdraw — Withdraw BNB (usage: /withdraw 0xAddress 0.1)\n"
@@ -830,6 +894,9 @@ class AgentLoop:
         if cmd == "/setup":
             return await self._handle_setup(msg, telegram_user_id)
 
+        if cmd == "/deposit":
+            return await self._handle_deposit(msg, telegram_user_id)
+
         if cmd == "/balance":
             return await self._handle_balance(msg, telegram_user_id)
 
@@ -879,9 +946,25 @@ class AgentLoop:
 
         # ---- Balance check --------------------------------------------------
         if not await self._check_balance(user):
+            wallet_addr = user.get("wallet_address", "")
+            if wallet_addr:
+                gate_msg = (
+                    "You need $FLAGENT to use me.\n"
+                    "1. Buy $FLAGENT on PancakeSwap (CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`)\n"
+                    f"2. Send $FLAGENT to your wallet: `{wallet_addr}`\n"
+                    "3. Tap /deposit to refresh your balance"
+                )
+            else:
+                gate_msg = (
+                    "You need $FLAGENT to use me.\n"
+                    "1. Buy $FLAGENT on PancakeSwap (CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`)\n"
+                    "2. Send $FLAGENT to your wallet\n"
+                    "3. Tap /deposit to refresh your balance\n\n"
+                    "No wallet yet? Run /setup first."
+                )
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
-                content="Deposit $FLAGENT to activate me.",
+                content=gate_msg,
             )
 
         # ---- Memory consolidation trigger -----------------------------------

@@ -160,6 +160,7 @@ class TelegramChannel(BaseChannel):
     BOT_COMMANDS = [
         BotCommand("start", "Meet your BSC assistant"),
         BotCommand("setup", "Create your trading wallet"),
+        BotCommand("deposit", "Refresh your $FLAGENT balance"),
         BotCommand("balance", "Check your BNB + $FLAGENT balance"),
         BotCommand("positions", "View your open trades"),
         BotCommand("withdraw", "Withdraw BNB to another wallet"),
@@ -228,8 +229,8 @@ class TelegramChannel(BaseChannel):
         self._app.add_error_handler(self._on_error)
 
         # Add command handlers — all forwarded to AgentLoop via bus
-        for cmd_name in ("start", "setup", "balance", "positions", "withdraw",
-                         "export_key", "usage", "help", "new", "stop"):
+        for cmd_name in ("start", "setup", "deposit", "balance", "positions",
+                         "withdraw", "export_key", "usage", "help", "new", "stop"):
             self._app.add_handler(CommandHandler(cmd_name, self._forward_command))
 
         # Add message handler for text, photos, voice, documents
