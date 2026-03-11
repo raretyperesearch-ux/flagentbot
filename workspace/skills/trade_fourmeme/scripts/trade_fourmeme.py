@@ -119,6 +119,9 @@ def _sb_headers() -> dict:
 async def _sb_get(table: str, params: dict) -> list[dict]:
     async with httpx.AsyncClient(timeout=15) as c:
         r = await c.get(f"{SUPABASE_URL}/{table}", headers=_sb_headers(), params=params)
+        print(f"[sb_get] {table} status={r.status_code} url={r.url}", file=sys.stderr)
+        if r.status_code != 200:
+            print(f"[sb_get] response: {r.text[:300]}", file=sys.stderr)
         r.raise_for_status()
         return r.json()
 
@@ -152,18 +155,24 @@ def decrypt_private_key(encrypted_b64: str) -> str:
 async def get_user_wallet(telegram_user_id: str) -> tuple[str, str]:
     """Returns (address, private_key) from bot_users."""
     sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    enc_key = os.environ.get("ENCRYPTION_KEY", "")
+    # Debug to stdout so Claude and Railway logs both see it
+    print(f"[wallet_lookup] telegram_user_id={telegram_user_id}")
+    print(f"[wallet_lookup] SUPABASE_SERVICE_KEY set: {bool(sb_key)} (len={len(sb_key)})")
+    print(f"[wallet_lookup] ENCRYPTION_KEY set: {bool(enc_key)}")
     if not sb_key:
         raise RuntimeError("SUPABASE_SERVICE_KEY not set — cannot read wallet from database")
-    print(f"[trade_fourmeme] Looking up wallet for telegram_user_id={telegram_user_id}", file=sys.stderr)
     try:
         rows = await _sb_get("bot_users", {"telegram_user_id": f"eq.{telegram_user_id}", "select": "wallet_address,encrypted_private_key"})
     except Exception as e:
-        print(f"[trade_fourmeme] Supabase query failed: {e}", file=sys.stderr)
+        print(f"[wallet_lookup] Supabase query FAILED: {e}")
         raise RuntimeError(f"Database error looking up wallet: {e}")
-    print(f"[trade_fourmeme] Got {len(rows)} rows", file=sys.stderr)
+    print(f"[wallet_lookup] Got {len(rows)} rows")
     if not rows:
         raise RuntimeError("No wallet found. Run /setup first.")
     row = rows[0]
+    print(f"[wallet_lookup] wallet_address: {row.get('wallet_address', 'MISSING')}")
+    print(f"[wallet_lookup] has encrypted_private_key: {bool(row.get('encrypted_private_key'))}")
     if not row.get("encrypted_private_key"):
         raise RuntimeError("No encrypted key found. Run /setup first.")
     pk = decrypt_private_key(row["encrypted_private_key"])
