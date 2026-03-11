@@ -207,6 +207,8 @@ def _error(what: str, why: str, fix: str) -> str:
 async def buy(telegram_user_id: str, token_address: str, bnb_amount: float) -> str:
     try:
         w3 = Web3(Web3.HTTPProvider(BSC_RPC))
+        from web3.middleware import ExtraDataToPOAMiddleware
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     except Exception:
         return _error("RPC connection failed", "Could not connect to BSC network.", "Try again in a moment.")
 
@@ -286,6 +288,8 @@ async def buy(telegram_user_id: str, token_address: str, bnb_amount: float) -> s
 async def sell(telegram_user_id: str, token_address: str, amount_or_percent: str) -> str:
     try:
         w3 = Web3(Web3.HTTPProvider(BSC_RPC))
+        from web3.middleware import ExtraDataToPOAMiddleware
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     except Exception:
         return _error("RPC connection failed", "Could not connect to BSC network.", "Try again in a moment.")
 

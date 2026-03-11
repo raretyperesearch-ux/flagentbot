@@ -116,6 +116,8 @@ async def withdraw_token(
 ) -> str:
     try:
         w3 = Web3(Web3.HTTPProvider(BSC_RPC))
+        from web3.middleware import ExtraDataToPOAMiddleware
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     except Exception:
         return _error("RPC connection failed", "Could not connect to BSC network.", "Try again in a moment.")
 

@@ -108,6 +108,8 @@ def time_ago(iso_str: str) -> str:
 
 async def build_portfolio(address: str, positions: list[dict]) -> str:
     w3 = Web3(Web3.HTTPProvider(BSC_RPC))
+    from web3.middleware import ExtraDataToPOAMiddleware
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
     # Aggregate positions by token
     buys: dict[str, float] = {}   # token -> total BNB invested

@@ -99,6 +99,8 @@ def detect_platform(token_address: str) -> dict:
     Returns: {"platform": str, "details": dict}
     """
     w3 = Web3(Web3.HTTPProvider(BSC_RPC))
+    from web3.middleware import ExtraDataToPOAMiddleware
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     token = Web3.to_checksum_address(token_address)
 
     # Step 1: Check Four.Meme

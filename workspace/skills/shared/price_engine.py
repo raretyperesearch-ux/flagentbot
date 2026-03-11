@@ -221,6 +221,8 @@ async def get_token_price(token_address: str) -> dict:
     Returns: {"price_bnb", "price_usd", "source", "liquidity_usd", "volume_24h_usd", "graduated"}
     """
     w3 = Web3(Web3.HTTPProvider(BSC_RPC))
+    from web3.middleware import ExtraDataToPOAMiddleware
+    w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
     # 1. Four.Meme (bonding curve tokens)
     fm = await _try_fourmeme(token_address, w3)
