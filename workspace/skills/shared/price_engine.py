@@ -96,6 +96,11 @@ FLAP_QUOTE_ABI = [{
 _bnb_price_cache: dict[str, float] = {}  # {"price": x, "ts": y}
 
 
+async def get_bnb_price() -> float | None:
+    """Public alias for getting BNB/USD price."""
+    return await _get_bnb_price_usd()
+
+
 async def _get_bnb_price_usd() -> float | None:
     """Fetch BNB/USD price from DexScreener. Cached for 5 minutes.
     Returns None if price cannot be determined.

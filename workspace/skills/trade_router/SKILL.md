@@ -17,21 +17,37 @@ Trigger when the user:
 - Says "ape into [token]" or "dump [token]"
 - Wants to trade any token and doesn't know which platform it's on
 
-## Detection logic
+## Detection Logic
 
-1. Call Four.Meme Helper3 `getTokenInfo(token)`
-2. If returns data + `liquidityAdded=false` → route to Four.Meme bonding curve
-3. If returns data + `liquidityAdded=true` → route to PancakeSwap (graduated)
-4. If no Four.Meme data → try PancakeSwap quote
-5. If nothing works → tell user "Token not found on any supported platform"
+1. **Check Four.Meme first**: run `fourmeme token-info --address <token>`
+   - If found + not graduated → route to **Four.Meme CLI** (`fourmeme buy`/`fourmeme sell`)
+   - If found + graduated → route to **PancakeSwap** skill
+2. **If not on Four.Meme**: try PancakeSwap V3 quote
+   - If quote succeeds → route to **PancakeSwap** skill
+3. **If nothing works** → tell user "Token not found on any supported platform"
 
-## Script usage
+## Safety Guards (apply to ALL routes)
 
+- **Max trade: 0.1 BNB** (unless user has higher `max_trade_bnb` in bot_users)
+- **Min trade: 0.001 BNB** (below this, gas makes it pointless)
+- **USD conversion**: if user says "$5 of token", get BNB price first and convert
+- **Balance check**: ensure user has enough BNB before executing
+- **Quote first**: always show user what they'll get before executing
+
+## Routing Commands
+
+### Four.Meme (bonding curve tokens)
 ```bash
-# Buy
-python scripts/trade_router.py <telegram_user_id> buy <token_address> <bnb_amount>
+fourmeme token-info --address 0xABC    # detect platform
+fourmeme quote-buy --token 0xABC --amount 0.01  # get quote
+fourmeme buy --token 0xABC --amount 0.01        # execute
+fourmeme quote-sell --token 0xABC --amount 1000
+fourmeme sell --token 0xABC --amount 1000
+```
 
-# Sell
+### PancakeSwap (graduated tokens)
+```bash
+python scripts/trade_router.py <telegram_user_id> buy <token_address> <bnb_amount>
 python scripts/trade_router.py <telegram_user_id> sell <token_address> <amount_or_percent>
 ```
 

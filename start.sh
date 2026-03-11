@@ -32,5 +32,11 @@ cat > ~/.nanobot/config.json << EOF
 }
 EOF
 
+# Create .env for fourmeme CLI
+cat > /app/.env << ENVEOF
+PRIVATE_KEY=${WALLET_PRIVATE_KEY}
+BSC_RPC_URL=https://bsc-dataseed.binance.org
+ENVEOF
+
 pip install -e .
 nanobot gateway

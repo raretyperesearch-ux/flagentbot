@@ -12,6 +12,12 @@ RUN uv pip install --system --no-cache -e .
 
 RUN mkdir -p /root/.nanobot/workspace/skills /root/.nanobot/workspace/memory /root/.nanobot/workspace/sessions /root/.nanobot/cron
 
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @four-meme/four-meme-ai@latest
+
 RUN chmod +x start.sh
 
 EXPOSE 18790

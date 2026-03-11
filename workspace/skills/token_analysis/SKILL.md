@@ -49,70 +49,22 @@ Key fields to extract from GoPlus response:
 - `lp_total_supply` — total LP tokens
 - `holders` — array of top holders with `address`, `percent`, `is_locked`, `is_contract`
 
-### 2. Four.Meme TokenManagerHelper3 (bonding curve status)
+### 2. Four.Meme Official CLI (bonding curve status)
 
-Contract: `0xF251F83e40a78868FcfA3FA4599Dad6494E46034` on BSC mainnet.
+Use the `fourmeme` CLI to get token details from Four.Meme:
 
-```python
-import httpx
+```bash
+# Get full token info (bonding curve status, price, supply, etc.)
+fourmeme token-info --address 0xABC
 
-# TokenManagerHelper3 getTokenInfo(address) → returns bonding curve data
-# Function selector: keccak256("getTokenInfo(address)")[:4]
-TOKEN_MANAGER_HELPER = "0xF251F83e40a78868FcfA3FA4599Dad6494E46034"
-BSC_RPC = "https://bsc-dataseed1.binance.org"
-
-async def four_meme_token_info(token_address: str) -> dict:
-    """Call Four.Meme TokenManagerHelper3.getTokenInfo() via eth_call."""
-    # Encode: getTokenInfo(address)
-    # selector = 0x1a7a98e2 (first 4 bytes of keccak256("getTokenInfo(address)"))
-    padded_addr = token_address.lower().replace("0x", "").zfill(64)
-    calldata = "0x1a7a98e2" + padded_addr
-
-    payload = {
-        "jsonrpc": "2.0", "id": 1, "method": "eth_call",
-        "params": [{"to": TOKEN_MANAGER_HELPER, "data": calldata}, "latest"]
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(BSC_RPC, json=payload)
-        result = resp.json().get("result", "0x")
-
-    if result == "0x" or len(result) < 66:
-        return {"on_four_meme": False}
-
-    # Decode response — the return is a struct with multiple uint256 fields
-    # Key fields (each 32 bytes / 64 hex chars after 0x prefix):
-    # The exact layout depends on the contract version, but typically includes:
-    # - raisedAmount (how much BNB raised in bonding curve)
-    # - totalSupply (token supply in curve)
-    # - graduated (bool — whether token has left bonding curve)
-    hex_data = result[2:]  # strip 0x
-    chunks = [hex_data[i:i+64] for i in range(0, len(hex_data), 64)]
-
-    return {
-        "on_four_meme": True,
-        "raw_chunks": chunks,
-        "chunk_count": len(chunks),
-    }
+# Get trending tokens on Four.Meme
+fourmeme token-rankings --type hot
+fourmeme token-rankings --type volume24h
+fourmeme token-rankings --type newest
+fourmeme token-rankings --type graduated
 ```
 
-The return struct layout (from the official ABI) is:
-```
-[0] version: uint256
-[1] tokenManager: address
-[2] quote: address          — 0x0 if still on bonding curve
-[3] lastPrice: uint256      — current price in wei
-[4] tradingFeeRate: uint256
-[5] minTradingFee: uint256
-[6] launchTime: uint256
-[7] offers: uint256         — remaining token supply in curve
-[8] maxOffers: uint256      — total token supply allocated to curve
-[9] funds: uint256          — BNB raised so far
-[10] maxFunds: uint256      — BNB target for graduation
-[11] liquidityAdded: bool   — true = graduated to PancakeSwap
-```
-
-Bonding progress = `100 - (offers * 100 / maxOffers)` percent.
-Token is still on curve if `liquidityAdded == false && quote == 0x0000...`.
+The `token-info` response includes bonding curve data: current price, funds raised, graduation status, and trading fees. Use this instead of raw eth_call for reliability.
 
 ### 3. Combining into a report
 
