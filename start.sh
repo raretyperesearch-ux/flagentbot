@@ -19,6 +19,7 @@ cat > ~/.nanobot/config.json << EOF
   },
   "agents": {
     "defaults": {
+      "workspace": "/app/workspace",
       "model": "claude-sonnet-4-20250514",
       "provider": "anthropic",
       "maxTokens": 4096
@@ -40,6 +41,11 @@ cat > ~/.nanobot/config.json << EOF
   }
 }
 EOF
+
+# Copy SOUL.md and cron to nanobot default location as fallback
+cp -f /app/workspace/SOUL.md ~/.nanobot/workspace/SOUL.md 2>/dev/null || true
+cp -r /app/workspace/skills/* ~/.nanobot/workspace/skills/ 2>/dev/null || true
+cp -r /app/cron/* ~/.nanobot/workspace/cron/ 2>/dev/null || true
 
 # Install and run
 pip install -e .
