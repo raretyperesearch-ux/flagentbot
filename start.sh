@@ -1,6 +1,13 @@
 #!/bin/bash
+mkdir -p ~/.nanobot/workspace/skills
+mkdir -p ~/.nanobot/workspace/memory
+
+# Pre-populate workspace with our custom files BEFORE nanobot creates defaults
+cp -f /app/workspace/SOUL.md ~/.nanobot/workspace/SOUL.md
+cp -rf /app/workspace/skills/* ~/.nanobot/workspace/skills/
+cp -rf /app/cron/* ~/.nanobot/workspace/cron/ 2>/dev/null || true
+
 # Generate config
-mkdir -p ~/.nanobot
 cat > ~/.nanobot/config.json << EOF
 {
   "providers": {
@@ -10,7 +17,6 @@ cat > ~/.nanobot/config.json << EOF
   },
   "agents": {
     "defaults": {
-      "workspace": "/app/workspace",
       "model": "claude-sonnet-4-20250514",
       "provider": "anthropic",
       "maxTokens": 4096
@@ -27,20 +33,4 @@ cat > ~/.nanobot/config.json << EOF
 EOF
 
 pip install -e .
-
-# Start nanobot in background
-nanobot gateway &
-NANOBOT_PID=$!
-
-# Wait for nanobot to create default workspace files
-sleep 5
-
-# NOW overwrite with our custom files
-cp -f /app/workspace/SOUL.md ~/.nanobot/workspace/SOUL.md 2>/dev/null || true
-cp -rf /app/workspace/skills/* ~/.nanobot/workspace/skills/ 2>/dev/null || true
-cp -rf /app/cron/* ~/.nanobot/workspace/cron/ 2>/dev/null || true
-
-echo "✓ Custom SOUL.md and skills injected"
-
-# Wait for nanobot process
-wait $NANOBOT_PID
+nanobot gateway
