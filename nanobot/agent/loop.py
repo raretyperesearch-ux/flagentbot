@@ -906,6 +906,185 @@ class AgentLoop:
             ),
         )
 
+    # ---- /withdraw_token command -------------------------------------------
+
+    async def _handle_withdraw_token(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
+        """Parse token withdrawal request and ask for confirmation."""
+        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
+        if not user.get("wallet_address"):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Run /setup first to create your wallet.",
+            )
+
+        parts = msg.content.strip().split()
+        if len(parts) != 4:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=(
+                    "Usage: /withdraw_token <token_address> <destination> <amount>\n"
+                    "Example: `/withdraw_token 0xToken... 0xDest... 1000`\n"
+                    "Use `all` to send your full balance."
+                ),
+            )
+
+        token_address = parts[1]
+        destination = parts[2]
+        amount_str = parts[3]
+
+        # Validate addresses
+        addr_pattern = r'^0x[0-9a-fA-F]{40}$'
+        if not re.match(addr_pattern, token_address):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Invalid token address format. Must be 0x followed by 40 hex characters.",
+            )
+        if not re.match(addr_pattern, destination):
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Invalid destination address format. Must be 0x followed by 40 hex characters.",
+            )
+
+        encrypted_key = user.get("encrypted_private_key")
+        if not encrypted_key:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Run /setup first to create your wallet.",
+            )
+
+        # Resolve "all" to actual balance for confirmation message
+        display_amount = amount_str
+        symbol = "tokens"
+        if amount_str.lower() in ("all", "100%"):
+            try:
+                from web3 import Web3
+                w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org"))
+                token_cs = Web3.to_checksum_address(token_address)
+                erc20_abi = [
+                    {"name": "balanceOf", "type": "function", "stateMutability": "view",
+                     "inputs": [{"name": "account", "type": "address"}],
+                     "outputs": [{"name": "", "type": "uint256"}]},
+                    {"name": "symbol", "type": "function", "stateMutability": "view",
+                     "inputs": [], "outputs": [{"name": "", "type": "string"}]},
+                ]
+                contract = w3.eth.contract(address=token_cs, abi=erc20_abi)
+                bal = contract.functions.balanceOf(
+                    Web3.to_checksum_address(user["wallet_address"])
+                ).call()
+                if bal == 0:
+                    return OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content="You hold 0 of this token. Nothing to withdraw.",
+                    )
+                display_amount = str(bal)
+                try:
+                    symbol = contract.functions.symbol().call()
+                except Exception:
+                    pass
+            except Exception:
+                display_amount = "all"
+        else:
+            # Try to get symbol for display
+            try:
+                from web3 import Web3
+                w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org"))
+                token_cs = Web3.to_checksum_address(token_address)
+                sym_abi = [{"name": "symbol", "type": "function", "stateMutability": "view",
+                            "inputs": [], "outputs": [{"name": "", "type": "string"}]}]
+                contract = w3.eth.contract(address=token_cs, abi=sym_abi)
+                symbol = contract.functions.symbol().call()
+            except Exception:
+                pass
+
+        # Store pending withdrawal with type="token"
+        self._pending_withdrawals[telegram_user_id] = {
+            "type": "token",
+            "token_address": token_address,
+            "address": destination,
+            "amount": amount_str,
+            "expires": time.time() + 60,
+        }
+
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=(
+                f"Send {display_amount} {symbol} to `{destination}`?\n"
+                f"Token: `{token_address}`\n"
+                f"Reply YES to confirm. Expires in 60 seconds."
+            ),
+        )
+
+    async def _execute_pending_token_withdrawal(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
+        """Execute a confirmed pending token withdrawal via the withdraw_token script."""
+        pending = self._pending_withdrawals.pop(telegram_user_id)
+        token_address = pending["token_address"]
+        destination = pending["address"]
+        amount = pending["amount"]
+
+        import subprocess
+        import sys as _sys
+        from pathlib import Path
+
+        script = Path(self.workspace) / "skills" / "withdraw_token" / "scripts" / "withdraw_token.py"
+        if not script.exists():
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Token withdrawal script not found. Contact support.",
+            )
+
+        try:
+            result = subprocess.run(
+                [_sys.executable, str(script), telegram_user_id, token_address, destination, amount],
+                capture_output=True, text=True, timeout=60,
+                env={**os.environ},
+            )
+            output = result.stdout.strip()
+            if result.returncode != 0:
+                err = result.stderr[:300] if result.stderr else "Withdrawal script failed"
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"Token withdrawal failed: {err}",
+                )
+
+            try:
+                data = json.loads(output)
+            except json.JSONDecodeError:
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=output or "Withdrawal completed but no output received.",
+                )
+
+            if data.get("status") == "error":
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=data.get("message", "Withdrawal failed."),
+                )
+
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=(
+                    f"Token withdrawal sent!\n\n"
+                    f"Token: {data.get('symbol', '?')} (`{token_address}`)\n"
+                    f"Amount: {data.get('amount', '?')}\n"
+                    f"To: `{destination}`\n"
+                    f"Tx: `{data.get('tx_hash', '?')}`"
+                ),
+                metadata={"buttons": [
+                    ["View Balance", "/balance"],
+                    ["Portfolio", "/positions"],
+                ]},
+            )
+        except subprocess.TimeoutExpired:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Token withdrawal timed out. BSC may be congested — try again.",
+            )
+        except Exception as e:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Token withdrawal failed: {e}",
+            )
+
     # ---- /usage command ----------------------------------------------------
 
     async def _handle_usage(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
@@ -960,6 +1139,7 @@ class AgentLoop:
                 "/balance — Check your BNB + $FLAGENT balance\n"
                 "/positions — View your open trades\n"
                 "/withdraw — Withdraw BNB (usage: /withdraw 0xAddress 0.1)\n"
+                "/withdraw_token — Send tokens to external wallet (usage: /withdraw_token 0xToken 0xDest amount)\n"
                 "/export_key — Export your wallet private key\n"
                 "/usage — See your $FLAGENT spending history\n"
                 "/help — Show this message\n"
@@ -1020,6 +1200,8 @@ class AgentLoop:
                     content="Withdrawal expired. Run /withdraw again.",
                 )
             if raw_text.upper() == "YES":
+                if pending.get("type") == "token":
+                    return await self._execute_pending_token_withdrawal(msg, telegram_user_id)
                 return await self._execute_pending_withdrawal(msg, telegram_user_id)
             else:
                 # Any other message cancels the pending withdrawal silently
@@ -1043,6 +1225,9 @@ class AgentLoop:
 
         if cmd == "/positions":
             return await self._handle_positions(msg, telegram_user_id)
+
+        if cmd_word == "/withdraw_token":
+            return await self._handle_withdraw_token(msg, telegram_user_id)
 
         if cmd_word == "/withdraw":
             return await self._handle_withdraw(msg, telegram_user_id)

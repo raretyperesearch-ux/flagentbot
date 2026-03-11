@@ -164,6 +164,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("balance", "Check your BNB + $FLAGENT balance"),
         BotCommand("positions", "View your open trades"),
         BotCommand("withdraw", "Withdraw BNB to another wallet"),
+        BotCommand("withdraw_token", "Send tokens to external wallet"),
         BotCommand("export_key", "Export your wallet private key"),
         BotCommand("usage", "See your $FLAGENT spending history"),
         BotCommand("help", "Show all commands"),
@@ -230,7 +231,7 @@ class TelegramChannel(BaseChannel):
 
         # Add command handlers — all forwarded to AgentLoop via bus
         for cmd_name in ("start", "setup", "deposit", "balance", "positions",
-                         "withdraw", "export_key", "usage", "help", "new", "stop"):
+                         "withdraw", "withdraw_token", "export_key", "usage", "help", "new", "stop"):
             self._app.add_handler(CommandHandler(cmd_name, self._forward_command))
 
         # Add callback query handler for inline keyboard buttons
