@@ -252,6 +252,10 @@ async def main(telegram_user_id: str) -> None:
         "order": "created_at.desc",
     })
 
+    if not positions:
+        print("No open positions yet. When you make trades through me, they'll show up here.")
+        return
+
     # 3. Build and print report
     report = await build_portfolio(address, positions)
     print(report)
