@@ -1,0 +1,5 @@
+{
+  "name": "check_alerts",
+  "message": "Run the alert checker: python3 workspace/skills/alerts/scripts/check_alerts.py. For each triggered alert, send the alert message to the user.",
+  "cron": "*/5 * * * *"
+}

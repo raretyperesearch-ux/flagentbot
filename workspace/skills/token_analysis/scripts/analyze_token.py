@@ -1,4 +1,4 @@
-"""Token analysis script — combines GoPlus security + Four.Meme bonding curve data."""
+"""Token analysis script — combines GoPlus security + Four.Meme bonding curve + DexScreener data."""
 
 import asyncio
 import json
@@ -8,6 +8,31 @@ import httpx
 
 BSC_RPC = "https://bsc-dataseed1.binance.org"
 TOKEN_MANAGER_HELPER = "0xF251F83e40a78868FcfA3FA4599Dad6494E46034"
+
+
+async def dexscreener_data(address: str) -> dict:
+    """Fetch DexScreener market data for a BSC token."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"https://api.dexscreener.com/latest/dex/tokens/{address}")
+            resp.raise_for_status()
+            pairs = resp.json().get("pairs", [])
+            bsc_pairs = [p for p in pairs if p.get("chainId") == "bsc"]
+            if not bsc_pairs:
+                return {}
+            best = max(bsc_pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+            return {
+                "price_usd": best.get("priceUsd"),
+                "price_native": best.get("priceNative"),
+                "liquidity_usd": best.get("liquidity", {}).get("usd"),
+                "volume_24h_usd": best.get("volume", {}).get("h24"),
+                "price_change_24h": best.get("priceChange", {}).get("h24"),
+                "dex": best.get("dexId", "?"),
+                "pair_address": best.get("pairAddress", "?"),
+                "fdv": best.get("fdv"),
+            }
+    except Exception:
+        return {}
 
 
 async def goplus_security(address: str) -> dict:
@@ -74,7 +99,7 @@ def format_tax(val: str) -> str:
         return "unknown"
 
 
-def format_report(address: str, gp: dict, fm: dict) -> str:
+def format_report(address: str, gp: dict, fm: dict, ds: dict | None = None) -> str:
     """Format combined analysis report."""
     name = gp.get("token_name", "Unknown")
     symbol = gp.get("token_symbol", "???")
@@ -146,6 +171,23 @@ def format_report(address: str, gp: dict, fm: dict) -> str:
     else:
         lines.append("Four.Meme: Not found (may be non-Four.Meme token)")
 
+    # DexScreener market data
+    if ds and ds.get("price_usd"):
+        lines.append("")
+        lines.append("Market Data (DexScreener):")
+        lines.append(f"  Price: ${float(ds['price_usd']):,.10f} USD ({ds.get('price_native', '?')} BNB)")
+        if ds.get("price_change_24h") is not None:
+            chg = float(ds["price_change_24h"])
+            sign = "+" if chg >= 0 else ""
+            lines.append(f"  24h Change: {sign}{chg:.2f}%")
+        if ds.get("volume_24h_usd") is not None:
+            lines.append(f"  24h Volume: ${float(ds['volume_24h_usd']):,.0f}")
+        if ds.get("liquidity_usd") is not None:
+            lines.append(f"  Liquidity: ${float(ds['liquidity_usd']):,.0f}")
+        if ds.get("fdv") is not None:
+            lines.append(f"  FDV: ${float(ds['fdv']):,.0f}")
+        lines.append(f"  DEX: {ds.get('dex', '?')}")
+
     # Top holders
     top_holders = (gp.get("holders") or [])[:5]
     if top_holders:
@@ -168,14 +210,16 @@ def format_report(address: str, gp: dict, fm: dict) -> str:
 async def main(address: str) -> None:
     gp_task = asyncio.create_task(goplus_security(address))
     fm_task = asyncio.create_task(four_meme_info(address))
+    ds_task = asyncio.create_task(dexscreener_data(address))
     gp = await gp_task
     fm = await fm_task
+    ds = await ds_task
 
     if not gp:
         print(f"No GoPlus data found for {address}. Token may be too new or invalid.")
         return
 
-    print(format_report(address, gp, fm))
+    print(format_report(address, gp, fm, ds))
 
 
 if __name__ == "__main__":

@@ -182,10 +182,23 @@ async def log_position(telegram_user_id: str, token: str, side: str, bnb_amount:
     })
 
 
+# ── Error helper ───────────────────────────────────────────────────────────
+def _error(what: str, why: str, fix: str) -> str:
+    return json.dumps({"status": "error", "message": f"\u274c {what}\n{why}\n{fix}"})
+
+
 # ── Trading ────────────────────────────────────────────────────────────────
 async def buy(telegram_user_id: str, token_address: str, bnb_amount: float) -> str:
-    w3 = Web3(Web3.HTTPProvider(BSC_RPC))
-    address, pk = await get_user_wallet(telegram_user_id)
+    try:
+        w3 = Web3(Web3.HTTPProvider(BSC_RPC))
+    except Exception:
+        return _error("RPC connection failed", "Could not connect to BSC network.", "Try again in a moment.")
+
+    try:
+        address, pk = await get_user_wallet(telegram_user_id)
+    except RuntimeError as e:
+        return _error("No wallet found", str(e), "Run /setup to create your wallet.")
+
     account = w3.eth.account.from_key(pk)
     token = Web3.to_checksum_address(token_address)
 
@@ -193,13 +206,27 @@ async def buy(telegram_user_id: str, token_address: str, bnb_amount: float) -> s
     fee_wei = total_wei * FEE_BPS // 10_000
     trade_wei = total_wei - fee_wei
 
+    # Check BNB balance
+    balance = w3.eth.get_balance(account.address)
+    needed = total_wei + w3.to_wei(0.002, "ether")
+    if balance < needed:
+        have = w3.from_wei(balance, "ether")
+        return _error(
+            "Insufficient BNB",
+            f"You have {have:.4f} BNB but need ~{w3.from_wei(needed, 'ether'):.4f} BNB (trade + gas).",
+            "Deposit more BNB to your wallet. Run /deposit to see your address.",
+        )
+
     # 1. Send fee to treasury
-    fee_hash = _build_and_send(w3, account, {
-        "to": TREASURY,
-        "value": fee_wei,
-        "gas": GAS_FEE_TRANSFER,
-    })
-    w3.eth.wait_for_transaction_receipt(fee_hash, timeout=30)
+    try:
+        fee_hash = _build_and_send(w3, account, {
+            "to": TREASURY,
+            "value": fee_wei,
+            "gas": GAS_FEE_TRANSFER,
+        })
+        w3.eth.wait_for_transaction_receipt(fee_hash, timeout=30)
+    except Exception as e:
+        return _error("Fee transfer failed", str(e)[:200], "Try again in a moment.")
 
     # 2. Get quote for slippage protection
     min_tokens = 0
@@ -211,14 +238,20 @@ async def buy(telegram_user_id: str, token_address: str, bnb_amount: float) -> s
     except Exception:
         pass
 
-    # 3. Buy on Flap.sh — buy(token, recipient, minAmount)
-    contract = w3.eth.contract(address=FLAP_PORTAL, abi=BUY_ABI)
-    tx_data = contract.functions.buy(token, account.address, min_tokens).build_transaction({
-        "from": account.address,
-        "value": trade_wei,
-        "gas": GAS_BUY,
-    })
-    buy_hash = _build_and_send(w3, account, tx_data)
+    # 3. Buy on Flap.sh
+    try:
+        contract = w3.eth.contract(address=FLAP_PORTAL, abi=BUY_ABI)
+        tx_data = contract.functions.buy(token, account.address, min_tokens).build_transaction({
+            "from": account.address,
+            "value": trade_wei,
+            "gas": GAS_BUY,
+        })
+        buy_hash = _build_and_send(w3, account, tx_data)
+    except Exception as e:
+        err_str = str(e)[:200]
+        if "revert" in err_str.lower() or "execution reverted" in err_str.lower():
+            return _error("Transaction reverted", "The Flap.sh contract rejected this trade.", "The token may not be tradeable right now. Try a smaller amount.")
+        return _error("Buy failed", err_str, "Try again or use a smaller amount.")
 
     await log_position(telegram_user_id, token_address, "buy", bnb_amount, "0", buy_hash)
 
@@ -236,8 +269,16 @@ async def buy(telegram_user_id: str, token_address: str, bnb_amount: float) -> s
 
 
 async def sell(telegram_user_id: str, token_address: str, amount_or_percent: str) -> str:
-    w3 = Web3(Web3.HTTPProvider(BSC_RPC))
-    address, pk = await get_user_wallet(telegram_user_id)
+    try:
+        w3 = Web3(Web3.HTTPProvider(BSC_RPC))
+    except Exception:
+        return _error("RPC connection failed", "Could not connect to BSC network.", "Try again in a moment.")
+
+    try:
+        address, pk = await get_user_wallet(telegram_user_id)
+    except RuntimeError as e:
+        return _error("No wallet found", str(e), "Run /setup to create your wallet.")
+
     account = w3.eth.account.from_key(pk)
     token = Web3.to_checksum_address(token_address)
 
@@ -245,7 +286,7 @@ async def sell(telegram_user_id: str, token_address: str, amount_or_percent: str
     balance = erc20.functions.balanceOf(account.address).call()
 
     if balance == 0:
-        return json.dumps({"status": "error", "message": "No token balance to sell"})
+        return _error("No tokens to sell", "Your wallet holds 0 of this token.", "Make sure you're using the correct token address.")
 
     symbol = "?"
     try:
@@ -260,10 +301,16 @@ async def sell(telegram_user_id: str, token_address: str, amount_or_percent: str
     else:
         sell_amount = int(float(amount_or_percent))
         if sell_amount > balance:
-            return json.dumps({
-                "status": "error",
-                "message": f"You hold {balance} {symbol} but tried to sell {sell_amount}. Use 'sell 100%' to sell your full balance.",
-            })
+            return _error(
+                "Insufficient token balance",
+                f"You hold {balance} {symbol} but tried to sell {sell_amount}.",
+                "Use 'sell 100%' to sell your full balance.",
+            )
+
+    # Check gas
+    gas_balance = w3.eth.get_balance(account.address)
+    if gas_balance < w3.to_wei(0.002, "ether"):
+        return _error("Insufficient BNB for gas", f"You have {w3.from_wei(gas_balance, 'ether'):.4f} BNB.", "Deposit at least 0.002 BNB for gas fees.")
 
     # 1. Get sell quote for slippage protection
     min_output = 0
@@ -276,21 +323,30 @@ async def sell(telegram_user_id: str, token_address: str, amount_or_percent: str
         pass
 
     # 2. Approve Flap.sh Portal
-    approve_tx = erc20.functions.approve(FLAP_PORTAL, sell_amount).build_transaction({
-        "from": account.address,
-        "gas": GAS_APPROVE,
-    })
-    approve_hash = _build_and_send(w3, account, approve_tx)
-    w3.eth.wait_for_transaction_receipt(approve_hash, timeout=30)
+    try:
+        approve_tx = erc20.functions.approve(FLAP_PORTAL, sell_amount).build_transaction({
+            "from": account.address,
+            "gas": GAS_APPROVE,
+        })
+        approve_hash = _build_and_send(w3, account, approve_tx)
+        w3.eth.wait_for_transaction_receipt(approve_hash, timeout=30)
+    except Exception as e:
+        return _error("Approve failed", str(e)[:200], "Try again in a moment.")
 
-    # 3. Sell via swapExactInput — params: (inputToken, outputToken, inputAmount, minOutputAmount, permitData)
-    contract = w3.eth.contract(address=FLAP_PORTAL, abi=SELL_ABI)
-    params = (token, ZERO_ADDR, sell_amount, min_output, b"")
-    sell_tx = contract.functions.swapExactInput(params).build_transaction({
-        "from": account.address,
-        "gas": GAS_SELL,
-    })
-    sell_hash = _build_and_send(w3, account, sell_tx)
+    # 3. Sell via swapExactInput
+    try:
+        contract = w3.eth.contract(address=FLAP_PORTAL, abi=SELL_ABI)
+        params = (token, ZERO_ADDR, sell_amount, min_output, b"")
+        sell_tx = contract.functions.swapExactInput(params).build_transaction({
+            "from": account.address,
+            "gas": GAS_SELL,
+        })
+        sell_hash = _build_and_send(w3, account, sell_tx)
+    except Exception as e:
+        err_str = str(e)[:200]
+        if "revert" in err_str.lower() or "execution reverted" in err_str.lower():
+            return _error("Transaction reverted", "The Flap.sh contract rejected this sell.", "The token may not be tradeable right now. Try again later or try a smaller amount.")
+        return _error("Sell failed", err_str, "Try again or use a smaller amount.")
 
     await log_position(telegram_user_id, token_address, "sell", 0, str(sell_amount), sell_hash)
 

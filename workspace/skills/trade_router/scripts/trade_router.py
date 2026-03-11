@@ -171,6 +171,10 @@ def detect_platform(token_address: str) -> dict:
     }
 
 
+def _error(what: str, why: str, fix: str) -> str:
+    return json.dumps({"status": "error", "message": f"\u274c {what}\n{why}\n{fix}"})
+
+
 def route_trade(user_id: str, action: str, token: str, amount: str, platform: str) -> str:
     """Execute the trade via the appropriate platform script."""
     script_map = {
@@ -181,7 +185,7 @@ def route_trade(user_id: str, action: str, token: str, amount: str, platform: st
 
     script = script_map.get(platform)
     if not script or not script.exists():
-        return json.dumps({"status": "error", "message": f"No trading script for platform: {platform}"})
+        return _error("Platform not supported", f"No trading script found for {platform}.", "This token may be on an unsupported DEX.")
 
     try:
         result = subprocess.run(
@@ -190,15 +194,13 @@ def route_trade(user_id: str, action: str, token: str, amount: str, platform: st
             env={**os.environ},
         )
         if result.returncode != 0:
-            return json.dumps({
-                "status": "error",
-                "message": result.stderr[:500] if result.stderr else "Trade script failed",
-            })
+            err = result.stderr[:300] if result.stderr else "Trade script exited with an error"
+            return _error("Trade failed", err, "Try again or use a different amount.")
         return result.stdout.strip()
     except subprocess.TimeoutExpired:
-        return json.dumps({"status": "error", "message": "Trade timed out after 60s"})
+        return _error("Trade timed out", "The transaction took longer than 60 seconds.", "BSC may be congested. Try again in a moment.")
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return _error("Trade error", str(e)[:200], "Try again in a moment.")
 
 
 async def main() -> None:

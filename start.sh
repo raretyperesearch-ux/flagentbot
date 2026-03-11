@@ -6,6 +6,9 @@ mkdir -p ~/.flagentbot/workspace/sessions
 # Copy skills into workspace
 cp -r workspace/skills/* ~/.flagentbot/workspace/skills/ 2>/dev/null || true
 
+# Copy cron configs
+cp -r cron/ ~/.flagentbot/cron/ 2>/dev/null || true
+
 # Generate config from env vars
 cat > ~/.flagentbot/config.json << EOF
 {
@@ -26,6 +29,13 @@ cat > ~/.flagentbot/config.json << EOF
       "enabled": true,
       "token": "${TELEGRAM_BOT_TOKEN}",
       "allowFrom": ["*"]
+    }
+  },
+  "tools": {
+    "web": {
+      "search": {
+        "apiKey": "${BRAVE_SEARCH_API_KEY:-}"
+      }
     }
   }
 }

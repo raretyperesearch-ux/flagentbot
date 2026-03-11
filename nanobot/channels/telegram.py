@@ -8,8 +8,8 @@ import time
 import unicodedata
 
 from loguru import logger
-from telegram import BotCommand, ReplyParameters, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 from nanobot.bus.events import OutboundMessage
@@ -233,6 +233,9 @@ class TelegramChannel(BaseChannel):
                          "withdraw", "export_key", "usage", "help", "new", "stop"):
             self._app.add_handler(CommandHandler(cmd_name, self._forward_command))
 
+        # Add callback query handler for inline keyboard buttons
+        self._app.add_handler(CallbackQueryHandler(self._on_callback_query))
+
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
             MessageHandler(
@@ -262,7 +265,7 @@ class TelegramChannel(BaseChannel):
 
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
-            allowed_updates=["message"],
+            allowed_updates=["message", "callback_query"],
             drop_pending_updates=True  # Ignore old messages on startup
         )
 
@@ -360,16 +363,36 @@ class TelegramChannel(BaseChannel):
                     **thread_kwargs,
                 )
 
+        # Build inline keyboard from metadata if present
+        reply_markup = None
+        buttons = msg.metadata.get("buttons")
+        if buttons and isinstance(buttons, list):
+            keyboard_rows = []
+            for btn in buttons:
+                if isinstance(btn, list) and len(btn) == 2:
+                    label, data = btn[0], btn[1]
+                    if isinstance(data, str) and data.startswith("https://"):
+                        keyboard_rows.append([InlineKeyboardButton(label, url=data)])
+                    else:
+                        # Truncate callback_data to 64 bytes (Telegram limit)
+                        cb_data = str(data)[:64]
+                        keyboard_rows.append([InlineKeyboardButton(label, callback_data=cb_data)])
+            if keyboard_rows:
+                reply_markup = InlineKeyboardMarkup(keyboard_rows)
+
         # Send text content
         if msg.content and msg.content != "[empty message]":
             is_progress = msg.metadata.get("_progress", False)
 
-            for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
+            chunks = split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN)
+            for i, chunk in enumerate(chunks):
+                # Only attach buttons to the last chunk
+                chunk_markup = reply_markup if (i == len(chunks) - 1) else None
                 # Final response: simulate streaming via draft, then persist
                 if not is_progress:
-                    await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
+                    await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs, reply_markup=chunk_markup)
                 else:
-                    await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+                    await self._send_text(chat_id, chunk, reply_params, thread_kwargs, reply_markup=chunk_markup)
 
     async def _send_text(
         self,
@@ -377,14 +400,17 @@ class TelegramChannel(BaseChannel):
         text: str,
         reply_params=None,
         thread_kwargs: dict | None = None,
+        reply_markup=None,
     ) -> None:
         """Send a plain text message with HTML fallback."""
+        markup_kwargs = {"reply_markup": reply_markup} if reply_markup else {}
         try:
             html = _markdown_to_telegram_html(text)
             await self._app.bot.send_message(
                 chat_id=chat_id, text=html, parse_mode="HTML",
                 reply_parameters=reply_params,
                 **(thread_kwargs or {}),
+                **markup_kwargs,
             )
         except Exception as e:
             logger.warning("HTML parse failed, falling back to plain text: {}", e)
@@ -394,6 +420,7 @@ class TelegramChannel(BaseChannel):
                     text=text,
                     reply_parameters=reply_params,
                     **(thread_kwargs or {}),
+                    **markup_kwargs,
                 )
             except Exception as e2:
                 logger.error("Error sending Telegram message: {}", e2)
@@ -404,6 +431,7 @@ class TelegramChannel(BaseChannel):
         text: str,
         reply_params=None,
         thread_kwargs: dict | None = None,
+        reply_markup=None,
     ) -> None:
         """Simulate streaming via send_message_draft, then persist with send_message."""
         draft_id = int(time.time() * 1000) % (2**31)
@@ -420,7 +448,7 @@ class TelegramChannel(BaseChannel):
             await asyncio.sleep(0.15)
         except Exception:
             pass
-        await self._send_text(chat_id, text, reply_params, thread_kwargs)
+        await self._send_text(chat_id, text, reply_params, thread_kwargs, reply_markup=reply_markup)
 
     @staticmethod
     def _sender_id(user) -> str:
@@ -694,6 +722,55 @@ class TelegramChannel(BaseChannel):
             pass
         except Exception as e:
             logger.debug("Typing indicator stopped for {}: {}", chat_id, e)
+
+    async def _on_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard button presses — treat callback data as a new inbound message."""
+        query = update.callback_query
+        if not query or not query.from_user:
+            return
+
+        # Acknowledge the button press
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+        user = query.from_user
+        chat_id = str(query.message.chat_id) if query.message else str(user.id)
+        sender_id = self._sender_id(user)
+        content = query.data or ""
+
+        if not content:
+            return
+
+        logger.debug("Callback query from {}: {}", sender_id, content)
+
+        # Start typing indicator
+        self._start_typing(chat_id)
+
+        # Build metadata from the callback query
+        metadata = {
+            "user_id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "is_group": query.message.chat.type != "private" if query.message else False,
+            "message_thread_id": getattr(query.message, "message_thread_id", None) if query.message else None,
+            "is_forum": bool(getattr(query.message.chat, "is_forum", False)) if query.message else False,
+        }
+        if query.message:
+            metadata["message_id"] = query.message.message_id
+
+        session_key = None
+        if query.message:
+            session_key = self._derive_topic_session_key(query.message)
+
+        await self._handle_message(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            content=content,
+            metadata=metadata,
+            session_key=session_key,
+        )
 
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""

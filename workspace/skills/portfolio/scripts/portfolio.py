@@ -1,17 +1,44 @@
-"""Portfolio viewer — BNB balance, token positions, PnL, trade history."""
+"""Portfolio viewer — BNB balance, token positions, live PnL, trade history."""
 
 import asyncio
 import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
+from web3 import Web3
+
+# Add shared skills to path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "shared"))
+from price_engine import get_token_price, _get_bnb_price_usd
 
 # ── Constants ──────────────────────────────────────────────────────────────
+BSC_RPC = "https://bsc-dataseed.binance.org"
 BSCSCAN_KEY = os.environ.get("BSCSCAN_API_KEY", "")
 BSCSCAN = "https://api.bscscan.com/api"
 SUPABASE_URL = "https://seartddspffufwiqzwvh.supabase.co/rest/v1"
+
+ERC20_BALANCE_ABI = [{
+    "name": "balanceOf",
+    "type": "function",
+    "stateMutability": "view",
+    "inputs": [{"name": "account", "type": "address"}],
+    "outputs": [{"name": "", "type": "uint256"}],
+}, {
+    "name": "decimals",
+    "type": "function",
+    "stateMutability": "view",
+    "inputs": [],
+    "outputs": [{"name": "", "type": "uint8"}],
+}, {
+    "name": "symbol",
+    "type": "function",
+    "stateMutability": "view",
+    "inputs": [],
+    "outputs": [{"name": "", "type": "string"}],
+}]
 
 
 # ── Supabase helpers ──────────────────────────────────────────────────────
@@ -46,18 +73,26 @@ async def get_bnb_balance(address: str) -> float:
     return wei / 1e18
 
 
-async def get_token_balances(address: str) -> list[dict]:
-    """Get recent token transfers to find tokens the wallet holds."""
-    data = await _bscscan({
-        "module": "account", "action": "tokentx", "address": address,
-        "startblock": 0, "endblock": 99999999,
-        "page": 1, "offset": 50, "sort": "desc",
-    })
-    result = data.get("result", [])
-    return result if isinstance(result, list) else []
+# ── On-chain token balance ───────────────────────────────────────────────
+def _get_token_balance(w3: Web3, token_address: str, wallet: str) -> tuple[int, int, str]:
+    """Returns (raw_balance, decimals, symbol)."""
+    token = Web3.to_checksum_address(token_address)
+    erc20 = w3.eth.contract(address=token, abi=ERC20_BALANCE_ABI)
+    balance = erc20.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
+    decimals = 18
+    symbol = "?"
+    try:
+        decimals = erc20.functions.decimals().call()
+    except Exception:
+        pass
+    try:
+        symbol = erc20.functions.symbol().call()
+    except Exception:
+        pass
+    return balance, decimals, symbol
 
 
-# ── Main logic ─────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────
 def time_ago(iso_str: str) -> str:
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
@@ -71,47 +106,93 @@ def time_ago(iso_str: str) -> str:
         return "?"
 
 
-def format_report(
-    address: str, bnb_balance: float,
-    positions: list[dict], token_summary: dict,
-) -> str:
-    lines = [
-        f"Portfolio for {address}",
-        f"BNB Balance: {bnb_balance:.4f} BNB",
-    ]
+async def build_portfolio(address: str, positions: list[dict]) -> str:
+    w3 = Web3(Web3.HTTPProvider(BSC_RPC))
 
     # Aggregate positions by token
-    buys: dict[str, dict] = {}
-    sells: dict[str, dict] = {}
+    buys: dict[str, float] = {}   # token -> total BNB invested
+    sells: dict[str, float] = {}  # token -> total BNB received
     for p in positions:
-        token = p.get("token_address", "").lower()
+        token = (p.get("token_address") or "").lower()
         side = p.get("side", "")
         bnb = float(p.get("bnb_amount", 0) or 0)
         if side == "buy":
-            if token not in buys:
-                buys[token] = {"total_bnb": 0, "count": 0}
-            buys[token]["total_bnb"] += bnb
-            buys[token]["count"] += 1
+            buys[token] = buys.get(token, 0) + bnb
         elif side == "sell":
-            if token not in sells:
-                sells[token] = {"total_bnb": 0, "count": 0}
-            sells[token]["total_bnb"] += bnb
-            sells[token]["count"] += 1
+            sells[token] = sells.get(token, 0) + bnb
 
-    # Open positions (bought but not fully sold)
-    open_tokens = set(buys.keys()) - set(sells.keys())
-    partially_sold = set(buys.keys()) & set(sells.keys())
-    all_active = open_tokens | partially_sold
+    active_tokens = set(buys.keys())
 
-    if all_active:
+    # Fetch BNB balance + BNB/USD price in parallel
+    bnb_task = asyncio.create_task(get_bnb_balance(address))
+    bnb_usd_task = asyncio.create_task(_get_bnb_price_usd())
+
+    # Fetch live prices for all active tokens
+    price_tasks = {t: asyncio.create_task(get_token_price(t)) for t in active_tokens}
+
+    bnb_balance = await bnb_task
+    bnb_usd = await bnb_usd_task
+    prices = {t: await task for t, task in price_tasks.items()}
+
+    # Build position lines with live PnL
+    lines = [
+        f"Portfolio for {address[:8]}...{address[-6:]}",
+        f"BNB: {bnb_balance:.4f} (~${bnb_balance * bnb_usd:,.2f})",
+    ]
+
+    total_invested = 0.0
+    total_current_value = 0.0
+    position_lines = []
+
+    for i, token in enumerate(sorted(active_tokens), 1):
+        invested_bnb = buys.get(token, 0)
+        sold_bnb = sells.get(token, 0)
+        total_invested += invested_bnb
+
+        # Get on-chain balance
+        try:
+            raw_bal, decimals, symbol = _get_token_balance(w3, token, address)
+            human_bal = raw_bal / (10 ** decimals)
+        except Exception:
+            raw_bal, decimals, symbol, human_bal = 0, 18, "?", 0
+
+        price_data = prices.get(token, {})
+        price_bnb = price_data.get("price_bnb", 0)
+        price_usd = price_data.get("price_usd", 0)
+        source = price_data.get("source", "unknown")
+
+        # Current value = on-chain balance * price
+        holding_value_bnb = human_bal * price_bnb if price_bnb > 0 else 0
+        holding_value_usd = human_bal * price_usd if price_usd > 0 else 0
+        total_current_value += holding_value_bnb
+
+        # PnL = current holding value + sold BNB - invested BNB
+        net_bnb = holding_value_bnb + sold_bnb - invested_bnb
+        pnl_pct = (net_bnb / invested_bnb * 100) if invested_bnb > 0 else 0
+
+        pnl_sign = "+" if net_bnb >= 0 else ""
+        pnl_str = f"{pnl_sign}{pnl_pct:.1f}%"
+
+        if human_bal > 0:
+            position_lines.append(
+                f"  {i}. {symbol} | {human_bal:,.0f} tokens"
+                f" | Worth: {holding_value_bnb:.4f} BNB (~${holding_value_usd:,.2f})"
+                f" | Cost: {invested_bnb:.4f} BNB | PnL: {pnl_str}"
+                f" [{source}]"
+            )
+        else:
+            # Fully sold
+            net = sold_bnb - invested_bnb
+            sign = "+" if net >= 0 else ""
+            position_lines.append(
+                f"  {i}. {symbol} | CLOSED"
+                f" | Invested: {invested_bnb:.4f} BNB | Returned: {sold_bnb:.4f} BNB"
+                f" | PnL: {sign}{net:.4f} BNB ({pnl_str})"
+            )
+
+    if position_lines:
         lines.extend(["", "Positions:"])
-        for i, token in enumerate(sorted(all_active), 1):
-            sym = token_summary.get(token, {}).get("symbol", token[:10] + "...")
-            bought_bnb = buys.get(token, {}).get("total_bnb", 0)
-            sold_bnb = sells.get(token, {}).get("total_bnb", 0)
-            net = bought_bnb - sold_bnb
-            status = "open" if token in open_tokens else "partial"
-            lines.append(f"  {i}. {sym} | Invested: {bought_bnb:.4f} BNB | Sold: {sold_bnb:.4f} BNB | Net: {net:.4f} BNB [{status}]")
+        lines.extend(position_lines)
 
     # Recent trades
     recent = sorted(positions, key=lambda p: p.get("created_at", ""), reverse=True)[:10]
@@ -119,23 +200,36 @@ def format_report(
         lines.extend(["", "Recent Trades:"])
         for i, p in enumerate(recent, 1):
             side = p.get("side", "?").upper()
-            token = p.get("token_address", "?")
-            sym = token_summary.get(token.lower(), {}).get("symbol", token[:10] + "...")
+            token = (p.get("token_address") or "?").lower()
+            # Try to get symbol from price data
+            sym = "?"
+            try:
+                _, _, sym = _get_token_balance(w3, token, address)
+            except Exception:
+                pass
             bnb = float(p.get("bnb_amount", 0) or 0)
             platform = p.get("platform", "?")
             tx = p.get("tx_hash", "?")[:16]
             ago = time_ago(p.get("created_at", ""))
             lines.append(f"  {i}. {side} {sym} | {bnb:.4f} BNB | {platform} | {ago} | {tx}...")
 
-    # Summary stats
-    total_bought = sum(b["total_bnb"] for b in buys.values())
-    total_sold = sum(s["total_bnb"] for s in sells.values())
+    # Summary
+    total_sold = sum(sells.values())
+    net_pnl_bnb = total_current_value + total_sold - total_invested
+    net_pnl_pct = (net_pnl_bnb / total_invested * 100) if total_invested > 0 else 0
+    sign = "+" if net_pnl_bnb >= 0 else ""
+
     lines.extend([
         "",
-        f"Total Invested: {total_bought:.4f} BNB",
+        f"Total Invested: {total_invested:.4f} BNB",
+        f"Holdings Value: {total_current_value:.4f} BNB (~${total_current_value * bnb_usd:,.2f})",
         f"Total Sold: {total_sold:.4f} BNB",
+        f"Net PnL: {sign}{net_pnl_bnb:.4f} BNB ({sign}{net_pnl_pct:.1f}%)",
         f"Total Trades: {len(positions)}",
     ])
+
+    if not BSCSCAN_KEY:
+        lines.insert(0, "WARNING: BSCSCAN_API_KEY not set. Balance queries may be rate-limited.\n")
 
     return "\n".join(lines)
 
@@ -152,29 +246,15 @@ async def main(telegram_user_id: str) -> None:
 
     address = users[0]["wallet_address"]
 
-    # 2. Fetch data in parallel
-    bnb_task = asyncio.create_task(get_bnb_balance(address))
-    positions_task = asyncio.create_task(_sb_get("bot_positions", {
+    # 2. Fetch positions
+    positions = await _sb_get("bot_positions", {
         "telegram_user_id": f"eq.{telegram_user_id}",
         "order": "created_at.desc",
-    }))
-    transfers_task = asyncio.create_task(get_token_balances(address))
+    })
 
-    bnb_balance = await bnb_task
-    positions = await positions_task
-    transfers = await transfers_task
-
-    # Build token symbol lookup from transfers
-    token_summary: dict[str, dict] = {}
-    for t in transfers:
-        ca = (t.get("contractAddress") or "").lower()
-        if ca and ca not in token_summary:
-            token_summary[ca] = {"symbol": t.get("tokenSymbol", "?")}
-
-    if not BSCSCAN_KEY:
-        print("WARNING: BSCSCAN_API_KEY not set. Balance queries may be rate-limited.\n")
-
-    print(format_report(address, bnb_balance, positions, token_summary))
+    # 3. Build and print report
+    report = await build_portfolio(address, positions)
+    print(report)
 
 
 if __name__ == "__main__":

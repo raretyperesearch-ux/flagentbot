@@ -454,6 +454,10 @@ class AgentLoop:
                     f"2. BNB — for gas when trading (0.005 BNB is enough to start)\n\n"
                     f"After sending $FLAGENT, tap /deposit to refresh your balance."
                 ),
+                metadata={"buttons": [
+                    ["Buy $FLAGENT", _PCS_SWAP_URL],
+                    ["Check Balance", "/deposit"],
+                ]},
             )
 
         # Generate new account
@@ -486,6 +490,10 @@ class AgentLoop:
                 f"2. BNB — for gas when trading (0.005 BNB is enough to start)\n\n"
                 f"After sending $FLAGENT, tap /deposit to refresh your balance."
             ),
+            metadata={"buttons": [
+                ["Buy $FLAGENT", _PCS_SWAP_URL],
+                ["Check Balance", "/deposit"],
+            ]},
         )
 
     # ---- /start command ----------------------------------------------------
@@ -507,6 +515,11 @@ class AgentLoop:
                     f"Just talk to me — drop a CA to analyze, a wallet to research, or tell me to trade.\n\n"
                     f"/help for all commands"
                 ),
+                metadata={"buttons": [
+                    ["Analyze Token", "How do I analyze a token?"],
+                    ["Trade", "How do I trade?"],
+                    ["Portfolio", "/positions"],
+                ]},
             )
 
         # Returning user without wallet
@@ -517,6 +530,10 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content="Welcome back! Run /setup to create your trading wallet.",
+                metadata={"buttons": [
+                    ["Setup Wallet", "/setup"],
+                    ["What can I do?", "What can you do?"],
+                ]},
             )
 
         # New user — full onboarding
@@ -539,6 +556,10 @@ class AgentLoop:
                 f"Buy here: {_PCS_SWAP_URL}\n\n"
                 "/help for all commands"
             ),
+            metadata={"buttons": [
+                ["Setup Wallet", "/setup"],
+                ["What can I do?", "What can you do?"],
+            ]},
         )
 
     # ---- /deposit command --------------------------------------------------
@@ -586,8 +607,41 @@ class AgentLoop:
                 {"telegram_user_id": telegram_user_id},
             )
 
+            # Check if this is first time reaching 25k (for quick-start message)
+            prev_balance = user.get("flagent_balance") or 0
+            first_activation = balance >= _MIN_FLAGENT_HOLD and prev_balance < _MIN_FLAGENT_HOLD
+
             if balance >= _MIN_FLAGENT_HOLD:
                 deposit_msg = f"Balance: {balance:,.2f} $FLAGENT — Full access unlocked."
+                buttons = [
+                    ["Analyze Token", "Paste a token CA to analyze"],
+                    ["Check Wallet", "Paste a wallet address to research"],
+                    ["Portfolio", "/positions"],
+                ]
+
+                if first_activation:
+                    deposit_msg += (
+                        "\n\nYou're activated! Here's what you can do:\n\n"
+                        "- Paste any token CA to analyze it\n"
+                        "- 'Check wallet 0x...' to research a trader\n"
+                        "- 'Buy 0.01 BNB of 0x...' to trade on Four.Meme\n"
+                        "- 'What's trending on BSC?' for ecosystem research\n"
+                        "- /positions to see your portfolio\n"
+                        "- /balance to check your funds\n"
+                        "- 'Alert me when 0xToken hits 0.001 BNB'\n\n"
+                        "Or just talk to me naturally — I understand what you need."
+                    )
+                    buttons = [
+                        ["Analyze Token", "Paste a token contract address"],
+                        ["BSC Research", "What's happening on BSC today?"],
+                        ["My Portfolio", "/positions"],
+                    ]
+
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=deposit_msg,
+                    metadata={"buttons": buttons},
+                )
             elif balance > 0:
                 needed = _MIN_FLAGENT_HOLD - balance
                 deposit_msg = (
