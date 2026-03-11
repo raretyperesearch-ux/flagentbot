@@ -16,7 +16,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @four-meme/four-meme-ai@latest tsx viem
+RUN mkdir -p /opt/fourmeme && \
+    cd /opt/fourmeme && \
+    npm init -y && \
+    npm install @four-meme/four-meme-ai@latest tsx viem && \
+    ln -sf /opt/fourmeme/node_modules/.bin/fourmeme /usr/local/bin/fourmeme
 
 RUN chmod +x start.sh
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Decrypt user wallet key, write temp .env, run fourmeme CLI command."""
-import os, sys, base64, subprocess, tempfile
+"""Decrypt user wallet key, pass via env vars, run fourmeme CLI command."""
+import os, sys, base64, subprocess
 import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -46,24 +46,23 @@ if __name__ == "__main__":
 
     private_key, wallet = get_user_key(user_id)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        env_path = os.path.join(tmpdir, ".env")
-        with open(env_path, "w") as f:
-            f.write(f"PRIVATE_KEY={private_key}\n")
-            f.write(f"BSC_RPC_URL=https://bsc-dataseed.binance.org\n")
+    env = os.environ.copy()
+    env["PRIVATE_KEY"] = private_key
+    env["BSC_RPC_URL"] = "https://bsc-dataseed.binance.org"
 
-        print(f"Wallet: {wallet}", file=sys.stderr)
-        print(f"Running: fourmeme {' '.join(fm_args)}", file=sys.stderr)
+    print(f"Wallet: {wallet}", file=sys.stderr)
+    print(f"Running: fourmeme {' '.join(fm_args)}", file=sys.stderr)
 
-        result = subprocess.run(
-            ["fourmeme"] + list(fm_args),
-            cwd=tmpdir,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        if result.stdout:
-            print(result.stdout)
-        if result.stderr:
-            print(result.stderr, file=sys.stderr)
-        sys.exit(result.returncode)
+    result = subprocess.run(
+        ["/opt/fourmeme/node_modules/.bin/fourmeme"] + list(fm_args),
+        cwd="/opt/fourmeme",
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env
+    )
+    if result.stdout:
+        print(result.stdout)
+    if result.stderr:
+        print(result.stderr, file=sys.stderr)
+    sys.exit(result.returncode)
