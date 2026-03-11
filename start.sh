@@ -1,16 +1,16 @@
 #!/bin/bash
-mkdir -p ~/.flagentbot/workspace/skills
-mkdir -p ~/.flagentbot/workspace/memory
-mkdir -p ~/.flagentbot/workspace/sessions
+mkdir -p ~/.nanobot/workspace/skills
+mkdir -p ~/.nanobot/workspace/memory
+mkdir -p ~/.nanobot/workspace/sessions
 
 # Copy skills into workspace
-cp -r workspace/skills/* ~/.flagentbot/workspace/skills/ 2>/dev/null || true
+cp -r workspace/skills/* ~/.nanobot/workspace/skills/ 2>/dev/null || true
 
 # Copy cron configs
-cp -r cron/ ~/.flagentbot/cron/ 2>/dev/null || true
+cp -r cron/ ~/.nanobot/cron/ 2>/dev/null || true
 
 # Generate config from env vars
-cat > ~/.flagentbot/config.json << EOF
+cat > ~/.nanobot/config.json << EOF
 {
   "providers": {
     "anthropic": {
