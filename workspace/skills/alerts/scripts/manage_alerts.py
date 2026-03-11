@@ -44,6 +44,9 @@ async def _sb_update(table: str, data: dict, filters: dict) -> None:
 
 
 # ── Commands ──────────────────────────────────────────────────────────────
+MAX_ALERTS_PER_USER = 10
+
+
 async def set_alert(telegram_user_id: str, alert_type: str, config_json: str) -> None:
     """Create a new alert."""
     valid_types = ("price_target", "wallet_watch", "volume_spike", "new_token")
@@ -55,6 +58,19 @@ async def set_alert(telegram_user_id: str, alert_type: str, config_json: str) ->
         config = json.loads(config_json)
     except json.JSONDecodeError:
         print(json.dumps({"status": "error", "message": "Invalid JSON config"}))
+        return
+
+    # Check alert count limit
+    existing = await _sb_get("bot_alerts", {
+        "telegram_user_id": f"eq.{telegram_user_id}",
+        "active": "eq.true",
+        "select": "id",
+    })
+    if len(existing) >= MAX_ALERTS_PER_USER:
+        print(json.dumps({
+            "status": "error",
+            "message": f"You have {len(existing)} active alerts (maximum {MAX_ALERTS_PER_USER}). Delete one first: 'delete alert [ID]'",
+        }))
         return
 
     row = {

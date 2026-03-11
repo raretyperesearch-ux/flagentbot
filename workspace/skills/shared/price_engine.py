@@ -92,8 +92,19 @@ FLAP_QUOTE_ABI = [{
 }]
 
 
-async def _get_bnb_price_usd() -> float:
-    """Fetch BNB/USD price from DexScreener (WBNB/USDT pair)."""
+# ── BNB price cache (5 minutes) ───────────────────────────────────────────
+_bnb_price_cache: dict[str, float] = {}  # {"price": x, "ts": y}
+
+
+async def _get_bnb_price_usd() -> float | None:
+    """Fetch BNB/USD price from DexScreener. Cached for 5 minutes.
+    Returns None if price cannot be determined.
+    """
+    import time as _time
+    cached_ts = _bnb_price_cache.get("ts", 0)
+    if _time.time() - cached_ts < 300 and "price" in _bnb_price_cache:
+        return _bnb_price_cache["price"]
+
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(f"https://api.dexscreener.com/latest/dex/tokens/{WBNB}")
@@ -101,10 +112,16 @@ async def _get_bnb_price_usd() -> float:
             pairs = r.json().get("pairs", [])
             for p in pairs:
                 if p.get("chainId") == "bsc" and p.get("priceUsd"):
-                    return float(p["priceUsd"])
+                    price = float(p["priceUsd"])
+                    _bnb_price_cache["price"] = price
+                    _bnb_price_cache["ts"] = _time.time()
+                    return price
     except Exception:
         pass
-    return 600.0  # fallback
+    # Return cached value if available, even if expired
+    if "price" in _bnb_price_cache:
+        return _bnb_price_cache["price"]
+    return None
 
 
 async def _try_fourmeme(token: str, w3: Web3) -> dict | None:
@@ -160,7 +177,7 @@ async def _try_dexscreener(token: str) -> dict | None:
                 return None
             bnb_price = await _get_bnb_price_usd()
             return {
-                "price_bnb": price_usd / bnb_price if bnb_price > 0 else 0,
+                "price_bnb": price_usd / bnb_price if bnb_price and bnb_price > 0 else 0,
                 "price_usd": price_usd,
                 "source": "dexscreener",
                 "graduated": True,
@@ -204,7 +221,7 @@ async def get_token_price(token_address: str) -> dict:
     fm = await _try_fourmeme(token_address, w3)
     if fm:
         bnb_usd = await _get_bnb_price_usd()
-        fm["price_usd"] = fm["price_bnb"] * bnb_usd
+        fm["price_usd"] = fm["price_bnb"] * bnb_usd if bnb_usd else None
         return fm
 
     # 2. DexScreener (graduated tokens — best data)
@@ -216,7 +233,7 @@ async def get_token_price(token_address: str) -> dict:
     pcs = await _try_pancakeswap(token_address, w3)
     if pcs:
         bnb_usd = await _get_bnb_price_usd()
-        pcs["price_usd"] = pcs["price_bnb"] * bnb_usd
+        pcs["price_usd"] = pcs["price_bnb"] * bnb_usd if bnb_usd else None
         return pcs
 
     return {

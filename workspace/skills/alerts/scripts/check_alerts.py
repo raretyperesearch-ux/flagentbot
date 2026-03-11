@@ -262,30 +262,41 @@ CHECKERS = {
 
 async def main() -> None:
     """Check all active alerts and output triggered ones."""
-    alerts = await _sb_get("bot_alerts", {
-        "active": "eq.true",
-        "order": "created_at.asc",
-    })
+    try:
+        alerts = await _sb_get("bot_alerts", {
+            "active": "eq.true",
+            "order": "created_at.asc",
+        })
+    except Exception as e:
+        print(json.dumps({"triggered": [], "checked": 0, "error": f"Failed to fetch alerts: {e}"}))
+        return
 
     if not alerts:
         print(json.dumps({"triggered": [], "checked": 0}))
         return
 
     triggered = []
+    errors = []
     for alert in alerts:
         alert_type = alert.get("alert_type", "")
         checker = CHECKERS.get(alert_type)
         if not checker:
             continue
 
-        result = await checker(alert)
-        if result:
-            triggered.append(result)
+        try:
+            result = await checker(alert)
+            if result:
+                triggered.append(result)
+        except Exception as e:
+            errors.append({"alert_id": alert.get("id"), "type": alert_type, "error": str(e)[:200]})
 
-    print(json.dumps({
+    output = {
         "triggered": triggered,
         "checked": len(alerts),
-    }))
+    }
+    if errors:
+        output["errors"] = errors
+    print(json.dumps(output))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """Four.Meme bonding curve trading — buy/sell via TokenManager2 on BSC."""
 
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -135,11 +136,12 @@ def _get_encryption_key() -> bytes:
         raise RuntimeError("ENCRYPTION_KEY not set")
     if len(raw) == 64:
         return bytes.fromhex(raw)
-    return raw.encode().ljust(32, b"\0")[:32]
+    raise RuntimeError("ENCRYPTION_KEY must be exactly 64 hex characters (32 bytes)")
 
 
-def decrypt_private_key(encrypted_hex: str) -> str:
-    data = bytes.fromhex(encrypted_hex)
+def decrypt_private_key(encrypted_b64: str) -> str:
+    """Decrypt a base64-encoded AES-256-GCM encrypted private key (matches loop.py)."""
+    data = base64.b64decode(encrypted_b64)
     nonce, ciphertext = data[:12], data[12:]
     aesgcm = AESGCM(_get_encryption_key())
     plaintext = aesgcm.decrypt(nonce, ciphertext, None)
@@ -149,21 +151,32 @@ def decrypt_private_key(encrypted_hex: str) -> str:
 # ── Core trading logic ────────────────────────────────────────────────────
 async def get_user_wallet(telegram_user_id: str) -> tuple[str, str]:
     """Returns (address, private_key) from bot_users."""
-    rows = await _sb_get("bot_users", {"telegram_user_id": f"eq.{telegram_user_id}", "select": "wallet_address,encrypted_key"})
+    rows = await _sb_get("bot_users", {"telegram_user_id": f"eq.{telegram_user_id}", "select": "wallet_address,encrypted_private_key"})
     if not rows:
         raise RuntimeError("No wallet found. Run /setup first.")
     row = rows[0]
-    if not row.get("encrypted_key"):
+    if not row.get("encrypted_private_key"):
         raise RuntimeError("No encrypted key found. Run /setup first.")
-    pk = decrypt_private_key(row["encrypted_key"])
+    pk = decrypt_private_key(row["encrypted_private_key"])
     return row["wallet_address"], pk
+
+
+MAX_GAS_PRICE = Web3.to_wei(10, "gwei")
 
 
 def _build_and_send(w3: Web3, account, tx_params: dict) -> str:
     """Sign and send a transaction, return tx hash hex."""
     tx_params["nonce"] = w3.eth.get_transaction_count(account.address)
     tx_params["chainId"] = CHAIN_ID
-    tx_params["gasPrice"] = w3.eth.gas_price
+    tx_params["gasPrice"] = min(w3.eth.gas_price, MAX_GAS_PRICE)
+    # Estimate gas with 20% buffer, fall back to hardcoded value
+    if "gas" in tx_params:
+        fallback_gas = tx_params["gas"]
+        try:
+            estimated = w3.eth.estimate_gas({k: v for k, v in tx_params.items() if k != "gas"})
+            tx_params["gas"] = int(estimated * 1.2)
+        except Exception:
+            tx_params["gas"] = fallback_gas
     signed = account.sign_transaction(tx_params)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     return tx_hash.hex()

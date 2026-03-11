@@ -53,11 +53,9 @@ def _encrypt_private_key(private_key_hex: str) -> str:
     enc_key = os.environ.get("ENCRYPTION_KEY", "")
     if not enc_key:
         raise RuntimeError("ENCRYPTION_KEY env var not set — cannot encrypt wallet key")
-    # Key should be 32 bytes; derive from hex or utf-8
-    if len(enc_key) == 64:
-        key_bytes = bytes.fromhex(enc_key)
-    else:
-        key_bytes = enc_key.encode("utf-8")[:32].ljust(32, b"\0")
+    if len(enc_key) != 64:
+        raise RuntimeError("ENCRYPTION_KEY must be exactly 64 hex characters (32 bytes)")
+    key_bytes = bytes.fromhex(enc_key)
     aesgcm = AESGCM(key_bytes)
     nonce = os.urandom(12)
     ct = aesgcm.encrypt(nonce, private_key_hex.encode("utf-8"), None)
@@ -71,10 +69,9 @@ def _decrypt_private_key(encrypted_b64: str) -> str:
     enc_key = os.environ.get("ENCRYPTION_KEY", "")
     if not enc_key:
         raise RuntimeError("ENCRYPTION_KEY env var not set")
-    if len(enc_key) == 64:
-        key_bytes = bytes.fromhex(enc_key)
-    else:
-        key_bytes = enc_key.encode("utf-8")[:32].ljust(32, b"\0")
+    if len(enc_key) != 64:
+        raise RuntimeError("ENCRYPTION_KEY must be exactly 64 hex characters (32 bytes)")
+    key_bytes = bytes.fromhex(enc_key)
     data = base64.b64decode(encrypted_b64)
     nonce, ct = data[:12], data[12:]
     aesgcm = AESGCM(key_bytes)
@@ -409,8 +406,47 @@ class AgentLoop:
         return result[0] if result else new_user
 
     async def _check_balance(self, user: dict) -> bool:
-        """Return True if user holds >= 25,000 $FLAGENT."""
-        return (user.get("flagent_balance") or 0) >= _MIN_FLAGENT_HOLD
+        """Return True if user holds >= 25,000 $FLAGENT.
+
+        If DB balance is below threshold, do a quick on-chain check in case
+        the user deposited but forgot to run /deposit.
+        """
+        db_balance = user.get("flagent_balance") or 0
+        if db_balance >= _MIN_FLAGENT_HOLD:
+            return True
+
+        # DB shows insufficient — verify on-chain before rejecting
+        wallet = user.get("wallet_address")
+        if not wallet:
+            return False
+        try:
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org"))
+            flagent_ca = Web3.to_checksum_address(_FLAGENT_CA)
+            erc20_abi = [{
+                "name": "balanceOf", "type": "function", "stateMutability": "view",
+                "inputs": [{"name": "account", "type": "address"}],
+                "outputs": [{"name": "", "type": "uint256"}],
+            }, {
+                "name": "decimals", "type": "function", "stateMutability": "view",
+                "inputs": [], "outputs": [{"name": "", "type": "uint8"}],
+            }]
+            contract = w3.eth.contract(address=flagent_ca, abi=erc20_abi)
+            raw = contract.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
+            try:
+                decimals = contract.functions.decimals().call()
+            except Exception:
+                decimals = 18
+            balance = raw / (10 ** decimals)
+            if balance >= _MIN_FLAGENT_HOLD:
+                # Update DB so we don't re-check next time
+                tid = user.get("telegram_user_id", "")
+                if tid:
+                    await db.update("bot_users", {"flagent_balance": balance}, {"telegram_user_id": tid})
+                return True
+        except Exception:
+            pass  # On-chain check failed — fall through to DB result
+        return False
 
     async def _log_usage(
         self, telegram_user_id: str, action_type: str, detail: str = "",
@@ -785,6 +821,30 @@ class AgentLoop:
                 content="Run /setup first to create your wallet.",
             )
 
+        # Check on-chain BNB balance and enforce gas reserve
+        try:
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org"))
+            bnb_balance_wei = w3.eth.get_balance(Web3.to_checksum_address(user["wallet_address"]))
+            bnb_balance = float(w3.from_wei(bnb_balance_wei, "ether"))
+            gas_reserve = 0.002
+            max_withdraw = bnb_balance - gas_reserve
+            if amount > max_withdraw:
+                if max_withdraw <= 0:
+                    return OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content=f"Your BNB balance is {bnb_balance:.4f} — not enough to withdraw and keep gas reserves.",
+                    )
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=(
+                        f"This would leave you with {bnb_balance - amount:.4f} BNB — not enough for gas.\n"
+                        f"Max you can withdraw: {max_withdraw:.4f} BNB (keeps 0.002 BNB for gas)."
+                    ),
+                )
+        except Exception as e:
+            logger.warning("BNB balance check failed for withdraw: {}", e)
+
         # Store pending withdrawal — requires YES confirmation
         self._pending_withdrawals[telegram_user_id] = {
             "address": target_address,
@@ -820,7 +880,7 @@ class AgentLoop:
                 "to": Web3.to_checksum_address(target_address),
                 "value": value_wei,
                 "gas": 21_000,
-                "gasPrice": w3.eth.gas_price,
+                "gasPrice": min(w3.eth.gas_price, w3.to_wei(10, "gwei")),
                 "nonce": w3.eth.get_transaction_count(account.address),
                 "chainId": 56,
             }
@@ -952,49 +1012,61 @@ class AgentLoop:
                 content="Run /setup first to create your wallet.",
             )
 
-        # Resolve "all" to actual balance for confirmation message
+        # Resolve amount for human-readable confirmation message
         display_amount = amount_str
         symbol = "tokens"
-        if amount_str.lower() in ("all", "100%"):
+        try:
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org"))
+            token_cs = Web3.to_checksum_address(token_address)
+            erc20_abi = [
+                {"name": "balanceOf", "type": "function", "stateMutability": "view",
+                 "inputs": [{"name": "account", "type": "address"}],
+                 "outputs": [{"name": "", "type": "uint256"}]},
+                {"name": "symbol", "type": "function", "stateMutability": "view",
+                 "inputs": [], "outputs": [{"name": "", "type": "string"}]},
+                {"name": "decimals", "type": "function", "stateMutability": "view",
+                 "inputs": [], "outputs": [{"name": "", "type": "uint8"}]},
+            ]
+            contract = w3.eth.contract(address=token_cs, abi=erc20_abi)
+            raw_bal = contract.functions.balanceOf(
+                Web3.to_checksum_address(user["wallet_address"])
+            ).call()
+            decimals = 18
             try:
-                from web3 import Web3
-                w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org"))
-                token_cs = Web3.to_checksum_address(token_address)
-                erc20_abi = [
-                    {"name": "balanceOf", "type": "function", "stateMutability": "view",
-                     "inputs": [{"name": "account", "type": "address"}],
-                     "outputs": [{"name": "", "type": "uint256"}]},
-                    {"name": "symbol", "type": "function", "stateMutability": "view",
-                     "inputs": [], "outputs": [{"name": "", "type": "string"}]},
-                ]
-                contract = w3.eth.contract(address=token_cs, abi=erc20_abi)
-                bal = contract.functions.balanceOf(
-                    Web3.to_checksum_address(user["wallet_address"])
-                ).call()
-                if bal == 0:
-                    return OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="You hold 0 of this token. Nothing to withdraw.",
-                    )
-                display_amount = str(bal)
-                try:
-                    symbol = contract.functions.symbol().call()
-                except Exception:
-                    pass
+                decimals = contract.functions.decimals().call()
             except Exception:
-                display_amount = "all"
-        else:
-            # Try to get symbol for display
+                pass
             try:
-                from web3 import Web3
-                w3 = Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org"))
-                token_cs = Web3.to_checksum_address(token_address)
-                sym_abi = [{"name": "symbol", "type": "function", "stateMutability": "view",
-                            "inputs": [], "outputs": [{"name": "", "type": "string"}]}]
-                contract = w3.eth.contract(address=token_cs, abi=sym_abi)
                 symbol = contract.functions.symbol().call()
             except Exception:
                 pass
+
+            if raw_bal == 0:
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="You hold 0 of this token. Nothing to withdraw.",
+                )
+
+            human_bal = raw_bal / (10 ** decimals)
+            if amount_str.lower() in ("all", "100%"):
+                display_amount = f"{human_bal:,.{min(decimals, 6)}f}"
+            else:
+                # User provides human-readable amount — validate it
+                try:
+                    human_amount = float(amount_str)
+                    raw_amount = int(human_amount * (10 ** decimals))
+                    if raw_amount > raw_bal:
+                        return OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content=f"You hold {human_bal:,.{min(decimals, 6)}f} {symbol} but tried to send {human_amount:,.{min(decimals, 6)}f}.",
+                        )
+                    display_amount = f"{human_amount:,.{min(decimals, 6)}f}"
+                except ValueError:
+                    display_amount = amount_str
+        except Exception:
+            if amount_str.lower() in ("all", "100%"):
+                display_amount = "all"
 
         # Store pending withdrawal with type="token"
         self._pending_withdrawals[telegram_user_id] = {

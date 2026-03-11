@@ -131,7 +131,7 @@ async def build_portfolio(address: str, positions: list[dict]) -> str:
     price_tasks = {t: asyncio.create_task(get_token_price(t)) for t in active_tokens}
 
     bnb_balance = await bnb_task
-    bnb_usd = await bnb_usd_task
+    bnb_usd = await bnb_usd_task or 0
     prices = {t: await task for t, task in price_tasks.items()}
 
     # Build position lines with live PnL

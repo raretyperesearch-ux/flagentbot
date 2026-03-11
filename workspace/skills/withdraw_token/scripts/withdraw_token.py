@@ -1,6 +1,7 @@
 """Token withdrawal — transfer ERC-20 tokens to an external BSC address."""
 
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ from web3 import Web3
 BSC_RPC = "https://bsc-dataseed.binance.org"
 CHAIN_ID = 56
 GAS_TRANSFER = 100_000
+MAX_GAS_PRICE = Web3.to_wei(10, "gwei")
 SUPABASE_URL = "https://seartddspffufwiqzwvh.supabase.co/rest/v1"
 
 ERC20_ABI = [
@@ -79,11 +81,12 @@ def _get_encryption_key() -> bytes:
         raise RuntimeError("ENCRYPTION_KEY not set")
     if len(raw) == 64:
         return bytes.fromhex(raw)
-    return raw.encode().ljust(32, b"\0")[:32]
+    raise RuntimeError("ENCRYPTION_KEY must be exactly 64 hex characters (32 bytes)")
 
 
-def decrypt_private_key(encrypted_hex: str) -> str:
-    data = bytes.fromhex(encrypted_hex)
+def decrypt_private_key(encrypted_b64: str) -> str:
+    """Decrypt a base64-encoded AES-256-GCM encrypted private key (matches loop.py)."""
+    data = base64.b64decode(encrypted_b64)
     nonce, ciphertext = data[:12], data[12:]
     aesgcm = AESGCM(_get_encryption_key())
     plaintext = aesgcm.decrypt(nonce, ciphertext, None)
@@ -93,14 +96,14 @@ def decrypt_private_key(encrypted_hex: str) -> str:
 async def get_user_wallet(telegram_user_id: str) -> tuple[str, str]:
     rows = await _sb_get("bot_users", {
         "telegram_user_id": f"eq.{telegram_user_id}",
-        "select": "wallet_address,encrypted_key",
+        "select": "wallet_address,encrypted_private_key",
     })
     if not rows:
         raise RuntimeError("No wallet found. Run /setup first.")
     row = rows[0]
-    if not row.get("encrypted_key"):
+    if not row.get("encrypted_private_key"):
         raise RuntimeError("No encrypted key found. Run /setup first.")
-    pk = decrypt_private_key(row["encrypted_key"])
+    pk = decrypt_private_key(row["encrypted_private_key"])
     return row["wallet_address"], pk
 
 
@@ -127,10 +130,15 @@ async def withdraw_token(
 
     erc20 = w3.eth.contract(address=token, abi=ERC20_ABI)
 
-    # Get symbol
+    # Get symbol and decimals
     symbol = "?"
+    decimals = 18
     try:
         symbol = erc20.functions.symbol().call()
+    except Exception:
+        pass
+    try:
+        decimals = erc20.functions.decimals().call()
     except Exception:
         pass
 
@@ -143,20 +151,22 @@ async def withdraw_token(
             "Make sure you're using the correct token address.",
         )
 
-    # Determine amount
+    # Determine amount — treat user input as human-readable (multiply by 10**decimals)
     if amount_str.lower() in ("all", "100%"):
         send_amount = balance
     else:
         try:
-            send_amount = int(float(amount_str))
+            human_amount = float(amount_str)
         except ValueError:
             return _error("Invalid amount", f"'{amount_str}' is not a valid number.", "Use a number or 'all'.")
-        if send_amount <= 0:
+        if human_amount <= 0:
             return _error("Invalid amount", "Amount must be greater than 0.", "Use a positive number or 'all'.")
+        send_amount = int(human_amount * (10 ** decimals))
         if send_amount > balance:
+            human_balance = balance / (10 ** decimals)
             return _error(
                 "Insufficient balance",
-                f"You hold {balance} {symbol} but tried to send {send_amount}.",
+                f"You hold {human_balance:,.{min(decimals, 6)}f} {symbol} but tried to send {human_amount:,.{min(decimals, 6)}f}.",
                 "Use 'all' to send your full balance.",
             )
 
@@ -177,7 +187,13 @@ async def withdraw_token(
         })
         tx_data["nonce"] = w3.eth.get_transaction_count(account.address)
         tx_data["chainId"] = CHAIN_ID
-        tx_data["gasPrice"] = w3.eth.gas_price
+        tx_data["gasPrice"] = min(w3.eth.gas_price, MAX_GAS_PRICE)
+        # Estimate gas with 20% buffer, fall back to hardcoded
+        try:
+            estimated = w3.eth.estimate_gas({k: v for k, v in tx_data.items() if k != "gas"})
+            tx_data["gas"] = int(estimated * 1.2)
+        except Exception:
+            pass  # keep GAS_TRANSFER fallback
         signed = account.sign_transaction(tx_data)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
     except Exception as e:
@@ -186,12 +202,14 @@ async def withdraw_token(
             return _error("Transfer reverted", "The token contract rejected this transfer.", "The token may restrict transfers. Check if it has transfer limits or is paused.")
         return _error("Transfer failed", err_str, "Try again in a moment.")
 
+    human_sent = send_amount / (10 ** decimals)
     return json.dumps({
         "status": "success",
         "tx_hash": tx_hash,
         "token": token_address,
         "symbol": symbol,
         "amount": str(send_amount),
+        "human_amount": f"{human_sent:,.{min(decimals, 6)}f}",
         "destination": destination,
     })
 
