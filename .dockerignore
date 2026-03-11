@@ -10,4 +10,5 @@ build/
 .assets
 node_modules/
 bridge/dist/
-workspace/
+workspace/memory/
+workspace/sessions/
