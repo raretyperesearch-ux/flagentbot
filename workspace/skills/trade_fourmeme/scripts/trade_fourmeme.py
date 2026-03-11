@@ -185,6 +185,7 @@ def _build_and_send(w3: Web3, account, tx_params: dict) -> str:
 async def log_position(telegram_user_id: str, token: str, side: str, cost_bnb: float, amount_tokens: str, tx_hash: str, platform: str) -> None:
     row = {
         "user_id": telegram_user_id,
+        "telegram_user_id": telegram_user_id,
         "token_address": token.lower(),
         "side": side,
         "cost_bnb": cost_bnb,

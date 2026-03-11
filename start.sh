@@ -1,15 +1,6 @@
 #!/bin/bash
-mkdir -p ~/.nanobot/workspace/skills
-mkdir -p ~/.nanobot/workspace/memory
-mkdir -p ~/.nanobot/workspace/sessions
-
-# Copy skills into workspace
-cp -r workspace/skills/* ~/.nanobot/workspace/skills/ 2>/dev/null || true
-
-# Copy cron configs
-cp -r cron/ ~/.nanobot/cron/ 2>/dev/null || true
-
-# Generate config from env vars
+# Generate config
+mkdir -p ~/.nanobot
 cat > ~/.nanobot/config.json << EOF
 {
   "providers": {
@@ -31,22 +22,25 @@ cat > ~/.nanobot/config.json << EOF
       "token": "${TELEGRAM_BOT_TOKEN}",
       "allowFrom": ["*"]
     }
-  },
-  "tools": {
-    "web": {
-      "search": {
-        "apiKey": "${BRAVE_SEARCH_API_KEY:-}"
-      }
-    }
   }
 }
 EOF
 
-# Copy SOUL.md and cron to nanobot default location as fallback
-cp -f /app/workspace/SOUL.md ~/.nanobot/workspace/SOUL.md 2>/dev/null || true
-cp -r /app/workspace/skills/* ~/.nanobot/workspace/skills/ 2>/dev/null || true
-cp -r /app/cron/* ~/.nanobot/workspace/cron/ 2>/dev/null || true
-
-# Install and run
 pip install -e .
-nanobot gateway
+
+# Start nanobot in background
+nanobot gateway &
+NANOBOT_PID=$!
+
+# Wait for nanobot to create default workspace files
+sleep 5
+
+# NOW overwrite with our custom files
+cp -f /app/workspace/SOUL.md ~/.nanobot/workspace/SOUL.md 2>/dev/null || true
+cp -rf /app/workspace/skills/* ~/.nanobot/workspace/skills/ 2>/dev/null || true
+cp -rf /app/cron/* ~/.nanobot/workspace/cron/ 2>/dev/null || true
+
+echo "✓ Custom SOUL.md and skills injected"
+
+# Wait for nanobot process
+wait $NANOBOT_PID

@@ -222,7 +222,7 @@ class ChannelsConfig(Base):
 class AgentDefaults(Base):
     """Default agent configuration."""
 
-    workspace: str = "~/.flagentbot/workspace"
+    workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-sonnet-4-20250514"
     provider: str = "anthropic"
     max_tokens: int = 8192

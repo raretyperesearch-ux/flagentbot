@@ -454,6 +454,7 @@ class AgentLoop:
         try:
             await db.insert("bot_usage_log", {
                 "user_id": telegram_user_id,
+                "telegram_user_id": telegram_user_id,
                 "action": action,
                 "flagent_cost": flagent_cost,
             })
@@ -747,7 +748,7 @@ class AgentLoop:
             )
 
         rows = await db.select("bot_positions", {
-            "user_id": f"eq.{telegram_user_id}",
+            "telegram_user_id": f"eq.{telegram_user_id}",
             "order": "created_at.desc",
             "limit": "20",
         })
@@ -1160,7 +1161,7 @@ class AgentLoop:
     async def _handle_usage(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
         """Show $FLAGENT spending history from bot_usage_log."""
         rows = await db.select("bot_usage_log", {
-            "user_id": f"eq.{telegram_user_id}",
+            "telegram_user_id": f"eq.{telegram_user_id}",
             "order": "created_at.desc",
             "limit": "100",
         })

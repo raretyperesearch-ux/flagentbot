@@ -248,7 +248,7 @@ async def main(telegram_user_id: str) -> None:
 
     # 2. Fetch positions
     positions = await _sb_get("bot_positions", {
-        "user_id": f"eq.{telegram_user_id}",
+        "telegram_user_id": f"eq.{telegram_user_id}",
         "order": "created_at.desc",
     })
 
