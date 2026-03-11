@@ -94,10 +94,19 @@ def decrypt_private_key(encrypted_b64: str) -> str:
 
 
 async def get_user_wallet(telegram_user_id: str) -> tuple[str, str]:
-    rows = await _sb_get("bot_users", {
-        "telegram_user_id": f"eq.{telegram_user_id}",
-        "select": "wallet_address,encrypted_private_key",
-    })
+    sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    if not sb_key:
+        raise RuntimeError("SUPABASE_SERVICE_KEY not set — cannot read wallet from database")
+    print(f"[withdraw_token] Looking up wallet for telegram_user_id={telegram_user_id}", file=sys.stderr)
+    try:
+        rows = await _sb_get("bot_users", {
+            "telegram_user_id": f"eq.{telegram_user_id}",
+            "select": "wallet_address,encrypted_private_key",
+        })
+    except Exception as e:
+        print(f"[withdraw_token] Supabase query failed: {e}", file=sys.stderr)
+        raise RuntimeError(f"Database error looking up wallet: {e}")
+    print(f"[withdraw_token] Got {len(rows)} rows", file=sys.stderr)
     if not rows:
         raise RuntimeError("No wallet found. Run /setup first.")
     row = rows[0]

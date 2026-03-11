@@ -220,6 +220,10 @@ async def main() -> None:
         print(f"Unknown action: {action}. Use 'buy' or 'sell'.")
         sys.exit(1)
 
+    # Debug: check env vars
+    print(f"[trade_router] SUPABASE_SERVICE_KEY set: {bool(os.environ.get('SUPABASE_SERVICE_KEY'))}", file=sys.stderr)
+    print(f"[trade_router] ENCRYPTION_KEY set: {bool(os.environ.get('ENCRYPTION_KEY'))}", file=sys.stderr)
+
     # Detect platform
     detection = detect_platform(token)
     platform = detection["platform"]
