@@ -25,6 +25,33 @@ GAS_FEE_TRANSFER = 21_000
 
 # Default fee tier for PancakeSwap V3 (0.25% = 2500)
 DEFAULT_FEE = 2500
+SLIPPAGE_BPS = 500  # 5% slippage tolerance
+
+# PancakeSwap V3 Quoter V2
+PANCAKE_QUOTER = Web3.to_checksum_address("0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997")
+
+QUOTER_ABI = [{
+    "name": "quoteExactInputSingle",
+    "type": "function",
+    "stateMutability": "nonpayable",
+    "inputs": [{
+        "name": "params",
+        "type": "tuple",
+        "components": [
+            {"name": "tokenIn", "type": "address"},
+            {"name": "tokenOut", "type": "address"},
+            {"name": "amountIn", "type": "uint256"},
+            {"name": "fee", "type": "uint24"},
+            {"name": "sqrtPriceLimitX96", "type": "uint160"},
+        ],
+    }],
+    "outputs": [
+        {"name": "amountOut", "type": "uint256"},
+        {"name": "sqrtPriceX96After", "type": "uint160"},
+        {"name": "initializedTicksCrossed", "type": "uint32"},
+        {"name": "gasEstimate", "type": "uint256"},
+    ],
+}]
 
 # ── ABI fragments ─────────────────────────────────────────────────────────
 # PancakeSwap V3 SmartRouter exactInputSingle
@@ -175,10 +202,19 @@ async def buy(telegram_user_id: str, token_address: str, bnb_amount: float) -> s
     })
     w3.eth.wait_for_transaction_receipt(fee_hash, timeout=30)
 
-    # 2. Swap BNB → token via PancakeSwap V3 exactInputSingle
-    # tokenIn = WBNB (native BNB sent as value), tokenOut = target token
+    # 2. Get quote for slippage protection
+    min_out = 0
+    try:
+        quoter = w3.eth.contract(address=PANCAKE_QUOTER, abi=QUOTER_ABI)
+        q_params = (WBNB, token, trade_wei, DEFAULT_FEE, 0)
+        quoted = quoter.functions.quoteExactInputSingle(q_params).call()
+        min_out = quoted[0] * (10_000 - SLIPPAGE_BPS) // 10_000
+    except Exception:
+        pass
+
+    # 3. Swap BNB → token via PancakeSwap V3 exactInputSingle
     router = w3.eth.contract(address=PANCAKE_ROUTER, abi=ROUTER_ABI)
-    params = (WBNB, token, DEFAULT_FEE, account.address, trade_wei, 0, 0)
+    params = (WBNB, token, DEFAULT_FEE, account.address, trade_wei, min_out, 0)
     tx_data = router.functions.exactInputSingle(params).build_transaction({
         "from": account.address,
         "value": trade_wei,
@@ -213,22 +249,35 @@ async def sell(telegram_user_id: str, token_address: str, amount_or_percent: str
     if balance == 0:
         return json.dumps({"status": "error", "message": "No token balance to sell"})
 
-    if amount_or_percent.endswith("%"):
-        pct = float(amount_or_percent[:-1])
-        sell_amount = int(balance * pct / 100)
-    else:
-        sell_amount = int(float(amount_or_percent))
-
-    if sell_amount > balance:
-        sell_amount = balance
-
     symbol = "?"
     try:
         symbol = erc20.functions.symbol().call()
     except Exception:
         pass
 
-    # 1. Approve PancakeSwap router
+    # Determine sell amount from on-chain balance
+    if amount_or_percent.endswith("%"):
+        pct = float(amount_or_percent[:-1])
+        sell_amount = int(balance * pct / 100)
+    else:
+        sell_amount = int(float(amount_or_percent))
+        if sell_amount > balance:
+            return json.dumps({
+                "status": "error",
+                "message": f"You hold {balance} {symbol} but tried to sell {sell_amount}. Use 'sell 100%' to sell your full balance.",
+            })
+
+    # 1. Get sell quote for slippage protection
+    min_out = 0
+    try:
+        quoter = w3.eth.contract(address=PANCAKE_QUOTER, abi=QUOTER_ABI)
+        q_params = (token, WBNB, sell_amount, DEFAULT_FEE, 0)
+        quoted = quoter.functions.quoteExactInputSingle(q_params).call()
+        min_out = quoted[0] * (10_000 - SLIPPAGE_BPS) // 10_000
+    except Exception:
+        pass
+
+    # 2. Approve PancakeSwap router
     approve_tx = erc20.functions.approve(PANCAKE_ROUTER, sell_amount).build_transaction({
         "from": account.address,
         "gas": GAS_APPROVE,
@@ -236,9 +285,9 @@ async def sell(telegram_user_id: str, token_address: str, amount_or_percent: str
     approve_hash = _build_and_send(w3, account, approve_tx)
     w3.eth.wait_for_transaction_receipt(approve_hash, timeout=30)
 
-    # 2. Swap token → WBNB via exactInputSingle
+    # 3. Swap token → WBNB via exactInputSingle
     router = w3.eth.contract(address=PANCAKE_ROUTER, abi=ROUTER_ABI)
-    params = (token, WBNB, DEFAULT_FEE, account.address, sell_amount, 0, 0)
+    params = (token, WBNB, DEFAULT_FEE, account.address, sell_amount, min_out, 0)
     sell_tx = router.functions.exactInputSingle(params).build_transaction({
         "from": account.address,
         "gas": GAS_SWAP,

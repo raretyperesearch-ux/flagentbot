@@ -7,6 +7,7 @@ import base64
 import json
 import os
 import re
+import time
 import weakref
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
@@ -83,6 +84,8 @@ def _decrypt_private_key(encrypted_b64: str) -> str:
 # -- hold-to-use threshold ---------------------------------------------------
 
 _MIN_FLAGENT_HOLD = 25_000  # Must hold 25k $FLAGENT for full access
+_FLAGENT_CA = "0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF"
+_PCS_SWAP_URL = f"https://pancakeswap.finance/swap?outputCurrency={_FLAGENT_CA}"
 
 
 class AgentLoop:
@@ -164,6 +167,7 @@ class AgentLoop:
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._pending_withdrawals: dict[str, dict] = {}  # telegram_user_id -> {address, amount, expires}
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
 
@@ -445,8 +449,8 @@ class AgentLoop:
                 content=(
                     f"Your wallet: `{addr}`\n\n"
                     f"To start, send two things to this address:\n"
-                    f"1. $FLAGENT — hold at least 25,000 to unlock the bot\n"
-                    f"   CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
+                    f"1. $FLAGENT — send at least 26,000 to account for the 3% transfer tax (you need 25,000 in your wallet to activate)\n"
+                    f"   Buy here: {_PCS_SWAP_URL}\n"
                     f"2. BNB — for gas when trading (0.005 BNB is enough to start)\n\n"
                     f"After sending $FLAGENT, tap /deposit to refresh your balance."
                 ),
@@ -477,8 +481,8 @@ class AgentLoop:
             content=(
                 f"Your wallet: `{wallet_address}`\n\n"
                 f"To start, send two things to this address:\n"
-                f"1. $FLAGENT — hold at least 25,000 to unlock the bot\n"
-                f"   CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
+                f"1. $FLAGENT — send at least 26,000 to account for the 3% transfer tax (you need 25,000 in your wallet to activate)\n"
+                f"   Buy here: {_PCS_SWAP_URL}\n"
                 f"2. BNB — for gas when trading (0.005 BNB is enough to start)\n\n"
                 f"After sending $FLAGENT, tap /deposit to refresh your balance."
             ),
@@ -487,8 +491,35 @@ class AgentLoop:
     # ---- /start command ----------------------------------------------------
 
     async def _handle_start(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
-        """Send the welcome message."""
-        await self._ensure_user(telegram_user_id, msg.metadata or {})
+        """Send the welcome message — returning users get a short version."""
+        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
+        wallet = user.get("wallet_address")
+        flagent_bal = user.get("flagent_balance") or 0
+
+        # Returning user with wallet
+        if wallet:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=(
+                    f"Welcome back to FlagentBot!\n\n"
+                    f"Your wallet: `{wallet}`\n"
+                    f"$FLAGENT balance: {flagent_bal:,.2f}\n\n"
+                    f"Just talk to me — drop a CA to analyze, a wallet to research, or tell me to trade.\n\n"
+                    f"/help for all commands"
+                ),
+            )
+
+        # Returning user without wallet
+        rows = await db.select("bot_users", {
+            "telegram_user_id": f"eq.{telegram_user_id}", "select": "id",
+        })
+        if rows and not wallet:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Welcome back! Run /setup to create your trading wallet.",
+            )
+
+        # New user — full onboarding
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
             content=(
@@ -501,10 +532,11 @@ class AgentLoop:
                 "- Track your portfolio and set alerts\n\n"
                 "Get started:\n"
                 "1. Run /setup to create your trading wallet\n"
-                "2. Buy $FLAGENT on PancakeSwap and send to your wallet\n"
+                f"2. Buy $FLAGENT on PancakeSwap and send at least 26,000 to your wallet (25,000 minimum + 3% transfer tax)\n"
                 "3. Tap /deposit to refresh your balance\n"
                 "4. Start asking me anything about BSC\n\n"
-                "$FLAGENT: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n\n"
+                f"$FLAGENT: `{_FLAGENT_CA}`\n"
+                f"Buy here: {_PCS_SWAP_URL}\n\n"
                 "/help for all commands"
             ),
         )
@@ -558,9 +590,12 @@ class AgentLoop:
                 deposit_msg = f"Balance: {balance:,.2f} $FLAGENT — Full access unlocked."
             elif balance > 0:
                 needed = _MIN_FLAGENT_HOLD - balance
-                deposit_msg = f"Balance: {balance:,.2f} $FLAGENT — You need at least 25,000 to activate. Send {needed:,.0f} more."
+                deposit_msg = (
+                    f"Balance: {balance:,.2f} $FLAGENT — You need at least 25,000 to activate. Send {needed:,.0f} more.\n\n"
+                    f"Buy here: {_PCS_SWAP_URL}"
+                )
             else:
-                deposit_msg = f"Balance: 0 $FLAGENT — Send $FLAGENT to `{wallet}` to activate."
+                deposit_msg = f"Balance: 0 $FLAGENT — Send $FLAGENT to `{wallet}` to activate.\n\nBuy here: {_PCS_SWAP_URL}"
 
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
@@ -653,7 +688,7 @@ class AgentLoop:
     # ---- /withdraw command -------------------------------------------------
 
     async def _handle_withdraw(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
-        """Send BNB from user's wallet to a target address."""
+        """Parse withdrawal request and ask for confirmation."""
         user = await self._ensure_user(telegram_user_id, msg.metadata or {})
         if not user.get("wallet_address"):
             return OutboundMessage(
@@ -683,7 +718,6 @@ class AgentLoop:
                 content="Amount must be greater than 0.",
             )
 
-        # Validate address format
         if not re.match(r'^0x[0-9a-fA-F]{40}$', target_address):
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
@@ -696,6 +730,30 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id,
                 content="Run /setup first to create your wallet.",
             )
+
+        # Store pending withdrawal — requires YES confirmation
+        self._pending_withdrawals[telegram_user_id] = {
+            "address": target_address,
+            "amount": amount,
+            "expires": time.time() + 60,
+        }
+
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=(
+                f"Send {amount} BNB to `{target_address}`?\n"
+                f"Reply YES to confirm. Expires in 60 seconds."
+            ),
+        )
+
+    async def _execute_pending_withdrawal(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
+        """Execute a confirmed pending withdrawal."""
+        pending = self._pending_withdrawals.pop(telegram_user_id)
+        target_address = pending["address"]
+        amount = pending["amount"]
+
+        user = await self._ensure_user(telegram_user_id, msg.metadata or {})
+        encrypted_key = user.get("encrypted_private_key")
 
         try:
             from web3 import Web3
@@ -774,12 +832,23 @@ class AgentLoop:
             {"telegram_user_id": telegram_user_id},
         )
 
-        return OutboundMessage(
+        # Send the key
+        await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
             content=(
                 f"⚠️ This is your private key. Anyone with this can access your funds. "
                 f"Import it into MetaMask or any BSC wallet. Never share it.\n\n"
                 f"`{pk}`"
+            ),
+        ))
+
+        # Send follow-up warning
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=(
+                "⚠️ DELETE THIS MESSAGE after saving your key.\n"
+                "Telegram messages are not end-to-end encrypted by default.\n"
+                "Import into MetaMask or Trust Wallet, then delete the message above."
             ),
         )
 
@@ -886,8 +955,24 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
+        # ---- Pending withdrawal confirmation -----------------------------------
+        raw_text = msg.content.strip()
+        if telegram_user_id in self._pending_withdrawals:
+            pending = self._pending_withdrawals[telegram_user_id]
+            if time.time() > pending["expires"]:
+                self._pending_withdrawals.pop(telegram_user_id, None)
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content="Withdrawal expired. Run /withdraw again.",
+                )
+            if raw_text.upper() == "YES":
+                return await self._execute_pending_withdrawal(msg, telegram_user_id)
+            else:
+                # Any other message cancels the pending withdrawal silently
+                self._pending_withdrawals.pop(telegram_user_id, None)
+
         # Slash commands
-        cmd = msg.content.strip().lower()
+        cmd = raw_text.lower()
         cmd_word = cmd.split()[0] if cmd else ""
 
         if cmd == "/start":
@@ -951,20 +1036,17 @@ class AgentLoop:
             wallet_addr = user.get("wallet_address", "")
             if wallet_addr:
                 gate_msg = (
-                    "You need to hold at least 25,000 $FLAGENT to use me.\n\n"
-                    "1. Buy $FLAGENT on PancakeSwap\n"
-                    "   CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
-                    f"2. Send to your wallet: `{wallet_addr}`\n"
-                    "3. Tap /deposit to refresh your balance\n\n"
-                    "Your tokens stay in your wallet. You're holding, not spending."
+                    "You need to hold at least 25,000 $FLAGENT to use me.\n"
+                    "Send at least 26,000 to cover the 3% transfer tax.\n\n"
+                    f"Buy on PancakeSwap: {_PCS_SWAP_URL}\n"
+                    f"Send to your wallet: `{wallet_addr}`\n"
+                    "Then tap /deposit to refresh."
                 )
             else:
                 gate_msg = (
-                    "You need to hold at least 25,000 $FLAGENT to use me.\n\n"
-                    "1. Buy $FLAGENT on PancakeSwap\n"
-                    "   CA: `0x1FF3506b0BC80c3CA027B6cEb7534FcfeDccFFFF`\n"
-                    "2. Send to your wallet\n"
-                    "3. Tap /deposit to refresh your balance\n\n"
+                    "You need to hold at least 25,000 $FLAGENT to use me.\n"
+                    "Send at least 26,000 to cover the 3% transfer tax.\n\n"
+                    f"Buy on PancakeSwap: {_PCS_SWAP_URL}\n\n"
                     "No wallet yet? Run /setup first."
                 )
             return OutboundMessage(

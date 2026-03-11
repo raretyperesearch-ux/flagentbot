@@ -49,6 +49,31 @@ SELL_ABI = [{
     "outputs": [],
 }]
 
+# Helper3 ABI for slippage estimation
+TRY_BUY_ABI = [{
+    "name": "tryBuy",
+    "type": "function",
+    "stateMutability": "view",
+    "inputs": [
+        {"name": "token", "type": "address"},
+        {"name": "funds", "type": "uint256"},
+    ],
+    "outputs": [{"name": "amount", "type": "uint256"}],
+}]
+
+TRY_SELL_ABI = [{
+    "name": "trySell",
+    "type": "function",
+    "stateMutability": "view",
+    "inputs": [
+        {"name": "token", "type": "address"},
+        {"name": "amount", "type": "uint256"},
+    ],
+    "outputs": [{"name": "funds", "type": "uint256"}],
+}]
+
+SLIPPAGE_BPS = 500  # 5% slippage tolerance
+
 ERC20_ABI = [
     {
         "name": "approve",
@@ -177,9 +202,18 @@ async def buy(telegram_user_id: str, token_address: str, bnb_amount: float) -> s
     # Wait for fee tx to confirm so nonce increments
     w3.eth.wait_for_transaction_receipt(fee_hash, timeout=30)
 
-    # 2. Buy on Four.Meme
+    # 2. Get quote for slippage protection
+    min_tokens = 0
+    try:
+        helper = w3.eth.contract(address=FM_HELPER, abi=TRY_BUY_ABI)
+        estimated = helper.functions.tryBuy(token, trade_wei).call()
+        min_tokens = estimated * (10_000 - SLIPPAGE_BPS) // 10_000
+    except Exception:
+        pass  # Fall back to no slippage protection
+
+    # 3. Buy on Four.Meme
     contract = w3.eth.contract(address=FM_TM2, abi=BUY_ABI)
-    tx_data = contract.functions.buyTokenAMAP(token, trade_wei, 0).build_transaction({
+    tx_data = contract.functions.buyTokenAMAP(token, trade_wei, min_tokens).build_transaction({
         "from": account.address,
         "value": trade_wei,
         "gas": GAS_BUY,
@@ -214,21 +248,23 @@ async def sell(telegram_user_id: str, token_address: str, amount_or_percent: str
     if balance == 0:
         return json.dumps({"status": "error", "message": "No token balance to sell"})
 
-    # Determine sell amount
-    if amount_or_percent.endswith("%"):
-        pct = float(amount_or_percent[:-1])
-        sell_amount = int(balance * pct / 100)
-    else:
-        sell_amount = int(float(amount_or_percent))
-
-    if sell_amount > balance:
-        sell_amount = balance
-
     symbol = "?"
     try:
         symbol = erc20.functions.symbol().call()
     except Exception:
         pass
+
+    # Determine sell amount from on-chain balance
+    if amount_or_percent.endswith("%"):
+        pct = float(amount_or_percent[:-1])
+        sell_amount = int(balance * pct / 100)
+    else:
+        sell_amount = int(float(amount_or_percent))
+        if sell_amount > balance:
+            return json.dumps({
+                "status": "error",
+                "message": f"You hold {balance} {symbol} but tried to sell {sell_amount}. Use 'sell 100%' to sell your full balance.",
+            })
 
     # 1. Approve TokenManager2
     approve_tx = erc20.functions.approve(FM_TM2, sell_amount).build_transaction({

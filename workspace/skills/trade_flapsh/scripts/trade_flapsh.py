@@ -57,6 +57,25 @@ SELL_ABI = [{
     "outputs": [],
 }]
 
+QUOTE_ABI = [{
+    "name": "quoteExactInput",
+    "type": "function",
+    "stateMutability": "view",
+    "inputs": [{
+        "name": "params",
+        "type": "tuple",
+        "components": [
+            {"name": "inputToken", "type": "address"},
+            {"name": "outputToken", "type": "address"},
+            {"name": "inputAmount", "type": "uint256"},
+            {"name": "permitData", "type": "bytes"},
+        ],
+    }],
+    "outputs": [{"name": "outputAmount", "type": "uint256"}],
+}]
+
+SLIPPAGE_BPS = 500  # 5% slippage tolerance
+
 ERC20_ABI = [
     {
         "name": "approve",
@@ -182,9 +201,19 @@ async def buy(telegram_user_id: str, token_address: str, bnb_amount: float) -> s
     })
     w3.eth.wait_for_transaction_receipt(fee_hash, timeout=30)
 
-    # 2. Buy on Flap.sh — buy(token, recipient, minAmount)
+    # 2. Get quote for slippage protection
+    min_tokens = 0
+    try:
+        quoter = w3.eth.contract(address=FLAP_PORTAL, abi=QUOTE_ABI)
+        params = (ZERO_ADDR, token, trade_wei, b"")
+        estimated = quoter.functions.quoteExactInput(params).call()
+        min_tokens = estimated * (10_000 - SLIPPAGE_BPS) // 10_000
+    except Exception:
+        pass
+
+    # 3. Buy on Flap.sh — buy(token, recipient, minAmount)
     contract = w3.eth.contract(address=FLAP_PORTAL, abi=BUY_ABI)
-    tx_data = contract.functions.buy(token, account.address, 0).build_transaction({
+    tx_data = contract.functions.buy(token, account.address, min_tokens).build_transaction({
         "from": account.address,
         "value": trade_wei,
         "gas": GAS_BUY,
@@ -218,22 +247,35 @@ async def sell(telegram_user_id: str, token_address: str, amount_or_percent: str
     if balance == 0:
         return json.dumps({"status": "error", "message": "No token balance to sell"})
 
-    if amount_or_percent.endswith("%"):
-        pct = float(amount_or_percent[:-1])
-        sell_amount = int(balance * pct / 100)
-    else:
-        sell_amount = int(float(amount_or_percent))
-
-    if sell_amount > balance:
-        sell_amount = balance
-
     symbol = "?"
     try:
         symbol = erc20.functions.symbol().call()
     except Exception:
         pass
 
-    # 1. Approve Flap.sh Portal
+    # Determine sell amount from on-chain balance
+    if amount_or_percent.endswith("%"):
+        pct = float(amount_or_percent[:-1])
+        sell_amount = int(balance * pct / 100)
+    else:
+        sell_amount = int(float(amount_or_percent))
+        if sell_amount > balance:
+            return json.dumps({
+                "status": "error",
+                "message": f"You hold {balance} {symbol} but tried to sell {sell_amount}. Use 'sell 100%' to sell your full balance.",
+            })
+
+    # 1. Get sell quote for slippage protection
+    min_output = 0
+    try:
+        quoter = w3.eth.contract(address=FLAP_PORTAL, abi=QUOTE_ABI)
+        params_q = (token, ZERO_ADDR, sell_amount, b"")
+        estimated = quoter.functions.quoteExactInput(params_q).call()
+        min_output = estimated * (10_000 - SLIPPAGE_BPS) // 10_000
+    except Exception:
+        pass
+
+    # 2. Approve Flap.sh Portal
     approve_tx = erc20.functions.approve(FLAP_PORTAL, sell_amount).build_transaction({
         "from": account.address,
         "gas": GAS_APPROVE,
@@ -241,9 +283,9 @@ async def sell(telegram_user_id: str, token_address: str, amount_or_percent: str
     approve_hash = _build_and_send(w3, account, approve_tx)
     w3.eth.wait_for_transaction_receipt(approve_hash, timeout=30)
 
-    # 2. Sell via swapExactInput — params: (inputToken, outputToken, inputAmount, minOutputAmount, permitData)
+    # 3. Sell via swapExactInput — params: (inputToken, outputToken, inputAmount, minOutputAmount, permitData)
     contract = w3.eth.contract(address=FLAP_PORTAL, abi=SELL_ABI)
-    params = (token, ZERO_ADDR, sell_amount, 0, b"")
+    params = (token, ZERO_ADDR, sell_amount, min_output, b"")
     sell_tx = contract.functions.swapExactInput(params).build_transaction({
         "from": account.address,
         "gas": GAS_SELL,

@@ -14,8 +14,10 @@ BSC_RPC = "https://bsc-dataseed.binance.org"
 
 FM_HELPER = Web3.to_checksum_address("0xF251F83e40a78868FcfA3FA4599Dad6494E46034")
 FM_TM2 = Web3.to_checksum_address("0x5c952063c7fc8610FFDB798152D69F0B9550762b")
+FLAP_PORTAL = Web3.to_checksum_address("0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0")
 PANCAKE_ROUTER = Web3.to_checksum_address("0x13f4EA83D0bd40E75C8222255bc855a974568Dd4")
 WBNB = Web3.to_checksum_address("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")
+ZERO_ADDR = "0x0000000000000000000000000000000000000000"
 
 # getTokenInfo returns a 12-field struct
 GET_TOKEN_INFO_ABI = [{
@@ -70,6 +72,24 @@ QUOTER_ABI = [{
 # PancakeSwap V3 Quoter V2
 PANCAKE_QUOTER = Web3.to_checksum_address("0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997")
 
+# Flap.sh quoteExactInput — used to detect if a token is on Flap.sh
+FLAP_QUOTE_ABI = [{
+    "name": "quoteExactInput",
+    "type": "function",
+    "stateMutability": "view",
+    "inputs": [{
+        "name": "params",
+        "type": "tuple",
+        "components": [
+            {"name": "inputToken", "type": "address"},
+            {"name": "outputToken", "type": "address"},
+            {"name": "inputAmount", "type": "uint256"},
+            {"name": "permitData", "type": "bytes"},
+        ],
+    }],
+    "outputs": [{"name": "outputAmount", "type": "uint256"}],
+}]
+
 SKILLS_DIR = Path(__file__).resolve().parent.parent.parent
 
 
@@ -112,9 +132,24 @@ def detect_platform(token_address: str) -> dict:
                     },
                 }
     except Exception:
-        pass  # Not on Four.Meme, try PancakeSwap
+        pass  # Not on Four.Meme, try Flap.sh
 
-    # Step 2: Try PancakeSwap quote
+    # Step 2: Check Flap.sh — try quoting a small BNB buy
+    try:
+        flap = w3.eth.contract(address=FLAP_PORTAL, abi=FLAP_QUOTE_ABI)
+        test_amount = w3.to_wei(0.001, "ether")
+        params = (ZERO_ADDR, token, test_amount, b"")
+        quote_result = flap.functions.quoteExactInput(params).call()
+        if quote_result > 0:
+            return {
+                "platform": "flap_sh",
+                "reason": "Token on Flap.sh bonding curve",
+                "details": {"quote_for_0.001_bnb": str(quote_result)},
+            }
+    except Exception:
+        pass  # Not on Flap.sh, try PancakeSwap
+
+    # Step 3: Try PancakeSwap quote
     try:
         quoter = w3.eth.contract(address=PANCAKE_QUOTER, abi=QUOTER_ABI)
         test_amount = w3.to_wei(0.001, "ether")  # Small test amount
@@ -188,7 +223,7 @@ async def main() -> None:
     if platform == "unknown":
         print(json.dumps({
             "status": "error",
-            "message": "Token not found on any supported platform (Four.Meme, PancakeSwap).",
+            "message": "Token not found on any supported platform (Four.Meme, Flap.sh, PancakeSwap).",
             "detection": detection,
         }))
         sys.exit(1)
