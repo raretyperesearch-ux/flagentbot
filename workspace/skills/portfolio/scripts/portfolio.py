@@ -115,7 +115,7 @@ async def build_portfolio(address: str, positions: list[dict]) -> str:
     for p in positions:
         token = (p.get("token_address") or "").lower()
         side = p.get("side", "")
-        bnb = float(p.get("bnb_amount", 0) or 0)
+        bnb = float(p.get("cost_bnb", 0) or 0)
         if side == "buy":
             buys[token] = buys.get(token, 0) + bnb
         elif side == "sell":
@@ -207,9 +207,9 @@ async def build_portfolio(address: str, positions: list[dict]) -> str:
                 _, _, sym = _get_token_balance(w3, token, address)
             except Exception:
                 pass
-            bnb = float(p.get("bnb_amount", 0) or 0)
+            bnb = float(p.get("cost_bnb", 0) or 0)
             platform = p.get("platform", "?")
-            tx = p.get("tx_hash", "?")[:16]
+            tx = (p.get("tx_hash_buy") or p.get("tx_hash_sell") or "?")[:16]
             ago = time_ago(p.get("created_at", ""))
             lines.append(f"  {i}. {side} {sym} | {bnb:.4f} BNB | {platform} | {ago} | {tx}...")
 
@@ -248,7 +248,7 @@ async def main(telegram_user_id: str) -> None:
 
     # 2. Fetch positions
     positions = await _sb_get("bot_positions", {
-        "telegram_user_id": f"eq.{telegram_user_id}",
+        "user_id": f"eq.{telegram_user_id}",
         "order": "created_at.desc",
     })
 

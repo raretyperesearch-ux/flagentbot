@@ -80,7 +80,7 @@ async def check_wallet_watch(alert: dict) -> dict | None:
                 to_addr = latest.get("to", "?")
                 return {
                     "alert_id": alert["id"],
-                    "telegram_user_id": alert["telegram_user_id"],
+                    "telegram_user_id": alert["user_id"],
                     "type": "wallet_watch",
                     "message": (
                         f"Wallet activity detected!\n"
@@ -122,13 +122,13 @@ async def check_price_target(alert: dict) -> dict | None:
         if triggered:
             await _sb_update("bot_alerts", {
                 "last_triggered": datetime.now(timezone.utc).isoformat(),
-                "active": False,  # One-shot: deactivate after trigger
+                "is_active": False,  # One-shot: deactivate after trigger
             }, {"id": f"eq.{alert['id']}"})
 
             price_usd = price_data.get("price_usd", 0)
             return {
                 "alert_id": alert["id"],
-                "telegram_user_id": alert["telegram_user_id"],
+                "telegram_user_id": alert["user_id"],
                 "type": "price_target",
                 "message": (
                     f"Price alert triggered!\n"
@@ -179,7 +179,7 @@ async def check_volume_spike(alert: dict) -> dict | None:
                 spike_pct = ((current_volume / baseline) - 1) * 100
                 return {
                     "alert_id": alert["id"],
-                    "telegram_user_id": alert["telegram_user_id"],
+                    "telegram_user_id": alert["user_id"],
                     "type": "volume_spike",
                     "message": (
                         f"Volume spike detected!\n"
@@ -241,7 +241,7 @@ async def check_new_token(alert: dict) -> dict | None:
 
             return {
                 "alert_id": alert["id"],
-                "telegram_user_id": alert["telegram_user_id"],
+                "telegram_user_id": alert["user_id"],
                 "type": "new_token",
                 "message": "\n".join(lines),
             }
@@ -264,7 +264,7 @@ async def main() -> None:
     """Check all active alerts and output triggered ones."""
     try:
         alerts = await _sb_get("bot_alerts", {
-            "active": "eq.true",
+            "is_active": "eq.true",
             "order": "created_at.asc",
         })
     except Exception as e:

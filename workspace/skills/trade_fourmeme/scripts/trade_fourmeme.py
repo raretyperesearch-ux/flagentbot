@@ -182,17 +182,21 @@ def _build_and_send(w3: Web3, account, tx_params: dict) -> str:
     return tx_hash.hex()
 
 
-async def log_position(telegram_user_id: str, token: str, side: str, bnb_amount: float, token_amount: str, tx_hash: str, platform: str) -> None:
-    await _sb_insert("bot_positions", {
-        "telegram_user_id": telegram_user_id,
+async def log_position(telegram_user_id: str, token: str, side: str, cost_bnb: float, amount_tokens: str, tx_hash: str, platform: str) -> None:
+    row = {
+        "user_id": telegram_user_id,
         "token_address": token.lower(),
         "side": side,
-        "bnb_amount": bnb_amount,
-        "token_amount": token_amount,
-        "tx_hash": tx_hash,
+        "cost_bnb": cost_bnb,
+        "amount_tokens": amount_tokens,
         "platform": platform,
         "created_at": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    if side == "buy":
+        row["tx_hash_buy"] = tx_hash
+    else:
+        row["tx_hash_sell"] = tx_hash
+    await _sb_insert("bot_positions", row)
 
 
 def _error(what: str, why: str, fix: str) -> str:

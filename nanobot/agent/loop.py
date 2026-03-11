@@ -398,8 +398,7 @@ class AgentLoop:
         first_name = metadata.get("first_name", "")
         new_user = {
             "telegram_user_id": telegram_user_id,
-            "telegram_username": username or "",
-            "display_name": first_name or username or telegram_user_id,
+            "username": username or "",
             "flagent_balance": 0,
         }
         result = await db.insert("bot_users", new_user)
@@ -449,14 +448,14 @@ class AgentLoop:
         return False
 
     async def _log_usage(
-        self, telegram_user_id: str, action_type: str, detail: str = "",
+        self, telegram_user_id: str, action: str, flagent_cost: float = 0,
     ) -> None:
         """Log action to bot_usage_log for analytics (no balance deduction)."""
         try:
             await db.insert("bot_usage_log", {
-                "telegram_user_id": telegram_user_id,
-                "action_type": action_type,
-                "detail": detail[:500] if detail else "",
+                "user_id": telegram_user_id,
+                "action": action,
+                "flagent_cost": flagent_cost,
             })
         except Exception:
             logger.exception("Failed to log usage for user {}", telegram_user_id)
@@ -748,7 +747,7 @@ class AgentLoop:
             )
 
         rows = await db.select("bot_positions", {
-            "telegram_user_id": f"eq.{telegram_user_id}",
+            "user_id": f"eq.{telegram_user_id}",
             "order": "created_at.desc",
             "limit": "20",
         })
@@ -764,10 +763,9 @@ class AgentLoop:
             side = (p.get("side") or "?").upper()
             token = p.get("token_address", "?")
             short_token = token[:6] + "..." + token[-4:] if len(token) > 12 else token
-            bnb = float(p.get("bnb_amount") or 0)
+            bnb = float(p.get("cost_bnb") or 0)
             platform = p.get("platform", "?")
-            tx = (p.get("tx_hash") or "?")[:16]
-            created = p.get("created_at", "")
+            tx = (p.get("tx_hash_buy") or p.get("tx_hash_sell") or "?")[:16]
             lines.append(f"{i}. {side} `{short_token}` | {bnb:.4f} BNB | {platform} | {tx}...")
 
         return OutboundMessage(
@@ -1162,7 +1160,7 @@ class AgentLoop:
     async def _handle_usage(self, msg: InboundMessage, telegram_user_id: str) -> OutboundMessage:
         """Show $FLAGENT spending history from bot_usage_log."""
         rows = await db.select("bot_usage_log", {
-            "telegram_user_id": f"eq.{telegram_user_id}",
+            "user_id": f"eq.{telegram_user_id}",
             "order": "created_at.desc",
             "limit": "100",
         })
@@ -1174,10 +1172,10 @@ class AgentLoop:
             )
 
         # Aggregate by action type
-        totals: dict[str, int] = {}
+        totals: dict[str, float] = {}
         for r in rows:
-            action = r.get("action_type", "unknown")
-            cost = int(r.get("cost") or 0)
+            action = r.get("action", "unknown")
+            cost = float(r.get("flagent_cost") or 0)
             totals[action] = totals.get(action, 0) + cost
 
         grand_total = sum(totals.values())
@@ -1428,10 +1426,7 @@ class AgentLoop:
 
         # ---- Usage logging (analytics only, no deduction) --------------------
         action_type = "tool_use" if tools_used else "chat"
-        await self._log_usage(
-            telegram_user_id, action_type,
-            detail=f"tools={','.join(tools_used[:5])}" if tools_used else "",
-        )
+        await self._log_usage(telegram_user_id, action_type)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None

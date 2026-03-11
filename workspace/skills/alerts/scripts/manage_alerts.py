@@ -62,8 +62,8 @@ async def set_alert(telegram_user_id: str, alert_type: str, config_json: str) ->
 
     # Check alert count limit
     existing = await _sb_get("bot_alerts", {
-        "telegram_user_id": f"eq.{telegram_user_id}",
-        "active": "eq.true",
+        "user_id": f"eq.{telegram_user_id}",
+        "is_active": "eq.true",
         "select": "id",
     })
     if len(existing) >= MAX_ALERTS_PER_USER:
@@ -74,10 +74,10 @@ async def set_alert(telegram_user_id: str, alert_type: str, config_json: str) ->
         return
 
     row = {
-        "telegram_user_id": telegram_user_id,
+        "user_id": telegram_user_id,
         "alert_type": alert_type,
         "config": config,
-        "active": True,
+        "is_active": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     result = await _sb_insert("bot_alerts", row)
@@ -93,8 +93,8 @@ async def set_alert(telegram_user_id: str, alert_type: str, config_json: str) ->
 async def list_alerts(telegram_user_id: str) -> None:
     """List all active alerts for a user."""
     rows = await _sb_get("bot_alerts", {
-        "telegram_user_id": f"eq.{telegram_user_id}",
-        "active": "eq.true",
+        "user_id": f"eq.{telegram_user_id}",
+        "is_active": "eq.true",
         "order": "created_at.desc",
     })
 
@@ -132,9 +132,9 @@ async def list_alerts(telegram_user_id: str) -> None:
 
 async def delete_alert(telegram_user_id: str, alert_id: str) -> None:
     """Deactivate an alert."""
-    await _sb_update("bot_alerts", {"active": False}, {
+    await _sb_update("bot_alerts", {"is_active": False}, {
         "id": f"eq.{alert_id}",
-        "telegram_user_id": f"eq.{telegram_user_id}",
+        "user_id": f"eq.{telegram_user_id}",
     })
     print(json.dumps({"status": "success", "message": f"Alert {alert_id} deleted."}))
 
